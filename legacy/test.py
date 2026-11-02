@@ -72,8 +72,10 @@ detected_peaks = []  # Store detected peak times to avoid duplicates
 last_value = None
 peak_cooldown = 0  # Prevent detecting multiple peaks too quickly
 
+punch_timeout = 1
+punch_start_time = 0
+
 # For velocity-based detection
-velocity_history = []  # Store recent velocities
 extension_history = []  # Store recent extensions for smoothing
 is_punching = False  # Track if we're in a punch motion
 punch_start_extension = None  # Extension at start of punch
@@ -82,6 +84,15 @@ punch_start_extension = None  # Extension at start of punch
 coords_buffer = []  # Each entry: [x1,y1,x2,y2,x3,y3,x4,y4] = RIGHT_WRIST, LEFT_WRIST, RIGHT_ELBOW, LEFT_ELBOW
 
 saved_frame = None
+
+
+hitX, hitY = 0, 0
+
+def average_velocity(data):
+    times, extensions = zip(*data)
+    t = np.array(times)
+    t = t - t[0]   # make time 0 the time of the first data point
+    return np.polyfit(t, np.array(extensions), 1)[0]  # vx vy vz slopes
 
 with vision.PoseLandmarker.create_from_options(options) as landmarker:
     while cap.isOpened():
@@ -101,8 +112,8 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
         image = frame.copy()
 
         # results.pose_landmarks is a list of poses; each pose is a list of landmarks
-        if results.pose_landmarks:
-            landmarks = results.pose_landmarks[0]
+        if results.pose_world_landmarks:
+            landmarks = results.pose_world_landmarks[0]
 
             # Get shoulder and wrist positions
             left_shoulder = landmarks[LEFT_SHOULDER]
@@ -112,19 +123,13 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
             left_elbow = landmarks[LEFT_ELBOW]
             right_elbow = landmarks[RIGHT_ELBOW]
 
-            # Store coordinates for classification: [RIGHT_WRIST, LEFT_WRIST, RIGHT_ELBOW, LEFT_ELBOW]
-            frame_coords = [
-                right_wrist.x, right_wrist.y,
-                left_wrist.x, left_wrist.y,
-                right_elbow.x, right_elbow.y,
-                left_elbow.x, left_elbow.y
-            ]
-            coords_buffer.append(frame_coords)
-            if len(coords_buffer) > 15:
-                coords_buffer.pop(0)  # Keep only last 15 frames
-
             left_wrist_array = np.array([left_wrist.x, left_wrist.y, left_wrist.z])
             left_shoulder_array = np.array([left_shoulder.x, left_shoulder.y, left_shoulder.z])
+
+            right_shoulder_array = np.array([right_shoulder.x, right_shoulder.y, right_shoulder.z])
+
+            shoulder_width = abs(np.linalg.norm(left_shoulder_array - right_shoulder_array))
+            
             extension_left = abs(np.linalg.norm(left_wrist_array - left_shoulder_array))
             current_extension_left = extension_left  # Update current value
 
@@ -137,64 +142,71 @@ with vision.PoseLandmarker.create_from_options(options) as landmarker:
 
             # Live peak detection using velocity (rate of change)
             if peak_cooldown > 0:
+                image = cv2.circle(image, (hitX, hitY), 30, (0, 255, 0))
                 peak_cooldown -= 1
 
             # Store extension history for smoothing
-            extension_history.append(extension_left)
-            if len(extension_history) > 5:
+            extension_history.append((elapsed, extension_left))
+            if len(extension_history) > 10:
                 extension_history.pop(0)
 
             # Calculate velocity (change in extension)
-            if last_value is not None:
-                velocity = extension_left - last_value
-                velocity_history.append(velocity)
-                if len(velocity_history) > 10:
-                    velocity_history.pop(0)
+            if len(extension_history) >= 5:
+                # velocity = extension_left - last_value
+                # velocity_history.append(velocity)
+                # if len(velocity_history) > 10:
+                #     velocity_history.pop(0)
 
-                # Only process if we have enough history
-                if len(velocity_history) >= 5 and len(left_data_list) >= 30:
-                    avg_velocity = np.mean(velocity_history[-5:])
-                    max_recent_velocity = max(velocity_history[-5:]) if velocity_history[-5:] else 0
+                avg_velocity = average_velocity(extension_history)
 
-                    # Velocity threshold - needs significant outward movement to start punch detection
-                    velocity_threshold = 0.008  # Adjust this based on testing
+                #print(avg_velocity)
 
-                    # Start tracking a punch when we see fast outward movement
-                    if not is_punching and max_recent_velocity > velocity_threshold and peak_cooldown == 0:
-                        is_punching = True
-                        punch_start_extension = extension_left
+                # max_recent_velocity = max(velocity_history[-5:]) if velocity_history[-5:] else 0
 
-                    # If we're in a punch, look for the peak (velocity goes from positive to negative)
-                    if is_punching:
-                        # Check if we've reached the peak (velocity becomes negative after being positive)
-                        if avg_velocity < -0.002 and extension_left > punch_start_extension + 0.05:
-                            # This is a real punch peak!
-                            current_time = round(time.time() - start_time, 1)
+                # Velocity threshold - needs significant outward movement to start punch detection
+                velocity_threshold = 0.4  # Adjust this based on testing
 
-                            # Classify the punch using last 15 frames
-                            print(f"\n*** PUNCH detected at {current_time}s! Extension: {extension_left:.4f} ***")
-                            if len(coords_buffer) < 15:
-                                print("*** Not enough frames for classification ***\n")
-                            detected_peaks.append(('PUNCH', current_time, extension_left))
+                # Start tracking a punch when we see fast outward movement
+                if not is_punching and avg_velocity > velocity_threshold and peak_cooldown <= 0:
+                    is_punching = True
+                    punch_start_extension = extension_left
+                    punch_start_time = elapsed
 
-                            saved_frame = image  # reference, so the skeleton drawn below also appears on it
+                # If we're in a punch, look for the peak (velocity goes from positive to negative)
+                if is_punching:
+                    # Check if we've reached the peak (velocity becomes negative after being positive)
+                    if avg_velocity < -0.002 and extension_left > punch_start_extension * 1.3:
+                        # This is a real punch peak!
+                        current_time = round(time.time() - start_time, 1)
 
-                            is_punching = False
-                            punch_start_extension = None
-                            peak_cooldown = 30  # Cooldown to avoid duplicate detections
+                        # Classify the punch using last 15 frames
+                        print(f"\n*** PUNCH detected at {current_time}s! Extension: {extension_left:.4f} ***")
 
-                        # Reset if extension dropped below start (aborted punch or arm returned)
-                        elif extension_left < punch_start_extension - 0.02:
-                            is_punching = False
-                            punch_start_extension = None
+                        detected_peaks.append(('PUNCH', current_time, extension_left))
 
-            last_value = extension_left
+                        saved_frame = image  # reference, so the skeleton drawn below also appears on it
+
+                        is_punching = False
+                        punch_start_extension = None
+                        peak_cooldown = 30  # Cooldown to avoid duplicate detections
+
+                    # Reset if extension dropped below start (aborted punch or arm returned)
+                    elif extension_left < punch_start_extension - 0.02 or elapsed - punch_start_time > punch_timeout:
+                        is_punching = False
+                        punch_start_extension = None
 
             # Draw pose landmarks on the image
-            draw_landmarks(image, landmarks)
+            draw_landmarks(image, results.pose_landmarks[0])
 
-        # Mirror the image horizontally
-        if saved_frame is not None:
+        h, w, _ = image.shape
+
+        thickness = 10
+        color = (0, 255, 0) if is_punching else (0, 0, 255)
+
+        image = cv2.rectangle(image, (0, 0), (w, h), color, thickness)
+
+        # Mirror the image horizontally saved_frame is not None
+        if False:
             cv2.imshow('Pose Detection', saved_frame)
         else:
             image = cv2.flip(image, 1)
