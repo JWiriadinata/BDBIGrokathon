@@ -23,7 +23,7 @@ export async function connect(cb) {
       cb.onMatchStart();
     })
     .on("attack", (m) => cb.onAttack(m.kind, m.attackId))
-    .on("state", (m) => { vs.health = m.health; })
+    .on("state", (m) => { vs.health = m.health; cb.onState?.(m.events ?? []); })
     .on("match_end", (m) => {
       vs.active = false; vs.health = m.health;
       const text = m.reason === "disconnect" ? "Opponent disconnected — you win"

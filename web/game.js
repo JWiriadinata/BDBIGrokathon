@@ -286,7 +286,7 @@ export const defense = {
   // Queue an attack of a given kind (from the opponent). Max ATTACK_QUEUE_MAX waiting; extras are dropped.
   enqueue(kind, meta = null) {
     if (!(kind in ATTACK_WEIGHTS) || this.queue.length >= ATTACK_QUEUE_MAX) return false;
-    this.queue.push({ kind, meta });
+    this.queue.push({ kind, meta, at: performance.now() / 1000 });
     return true;
   },
   activeWindow() { return this.attack ? [this.attack.activeStart, this.attack.activeEnd] : null; },
@@ -300,6 +300,14 @@ export const defense = {
       const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
       // If this would collide with a punch moment, try again next frame.
       if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) this.attack = spawnAttack(lms, now);
+    }
+    // Versus: a queued attack that can't be placed because no pose is visible (player out of frame) lands.
+    if (!this.attack && !lms && this.queue.length && now - this.queue[0].at > ATTACK_WARNING_S + ATTACK_ACTIVE_S) {
+      const q = this.queue.shift();
+      this.stats.hit += 1;
+      this.lastEvent = { outcome: "Hit", pos: [W / 2, H / 2], kind: q.kind, meta: q.meta };
+      this.nextQueuedAt = now + ATTACK_MIN_GAP_S;
+      return "Hit";
     }
     const a = this.attack;
     if (!a) return null;
@@ -604,14 +612,28 @@ function drawRoundText(now) {
 
 // ── Versus mode ──────────────────────────────────────────────────────────────
 // Own punches become attacks on the opponent; the opponent's arrive through defense.enqueue().
+// The model only learned the stance-default hand per punch type, and we don't know the type yet: run the clip
+// as thrown (valid for types whose default hand is ev.side) and mirrored (valid for the other types), and keep
+// the most confident valid answer.
+async function runModel(clip) {
+  const out = await session.run({ input: new ort.Tensor("float32", buildTensor(clip), [1, 7, CLIP_FRAMES, 4, 3]) });
+  const logits = Array.from(out.logits.data), m = Math.max(...logits);
+  const exps = logits.map((l) => Math.exp(l - m)), sum = exps.reduce((a, b) => a + b);
+  return exps.map((e) => e / sum);
+}
 async function punchKind(ev) {
   const clip = segmentClip(ev.startT, ev.endT);
   if (!clip || !session) return ["jab", 0];
   try {
-    const out = await session.run({ input: new ort.Tensor("float32", buildTensor(clip), [1, 7, CLIP_FRAMES, 4, 3]) });
-    const logits = Array.from(out.logits.data), best = logits.indexOf(Math.max(...logits));
-    const m = Math.max(...logits), sum = logits.reduce((a, l) => a + Math.exp(l - m), 0);
-    return [MODEL_TO_TARGET[CLASS_NAMES[best]] ?? "jab", 1 / sum];
+    const plain = await runModel(clip), mirrored = await runModel(mirrorSkeleton(clip));
+    let best = ["jab", 0];
+    CLASS_NAMES.forEach((name, i) => {
+      const kind = MODEL_TO_TARGET[name];
+      if (!kind) return;
+      const conf = choosePunchSide(kind, false) === ev.side ? plain[i] : mirrored[i];
+      if (conf > best[1]) best = [kind, conf];
+    });
+    return best;
   } catch (e) { console.error("classify failed", e); return ["jab", 0]; }
 }
 
@@ -748,6 +770,13 @@ function showLobby(html) {
 const vsCallbacks = {
   status: (html) => { statusEl.innerHTML = html; startBtn.hidden = true; $("vsJoinRow").hidden = $("vsCreate").hidden = true; panel.hidden = false; },
   onMatchStart: () => { versus = true; panel.hidden = true; mode = "countdown"; },
+  // Attacker sees what their punch did on the opponent's screen.
+  onState: (events) => {
+    const now = performance.now() / 1000;
+    for (const e of events) if (e.from === V.vs.me && st && versus && mode === "playing")
+      st.texts.push({ text: { Hit: "LANDED!", Block: "BLOCKED", Dodge: "DODGED" }[e.result], pos: [W / 2, H * 0.65],
+                      color: e.result === "Hit" ? [255, 230, 0] : [200, 200, 200], born: now, scale: 1.3 });
+  },
   onAttack: (kind, attackId) => { if (versus && mode === "playing") defense.enqueue(kind, { attackId }); },
   onEnd: (text) => {
     mode = "ready"; defense.reset();
@@ -812,6 +841,6 @@ async function init() {
 }
 
 // Debug/test hook (used by the headless two-browser test): inspect versus state, inject punches/outcomes.
-window.__pp = { V, defense, getMode: () => mode, isVersus: () => versus };
+if (new URLSearchParams(location.search).has("debug")) window.__pp = { V, defense, getMode: () => mode, isVersus: () => versus };
 
 init();
