@@ -21,6 +21,7 @@ The web game is a port of the repo's Python desktop game (`main_python_analysis.
 
 ```
 web/
+├── .nojekyll           Stops GitHub Pages from running Jekyll on this folder
 ├── index.html          Page shell, start/lobby panel; loads PeerJS then game.js
 ├── game.js             The game: init, main loop, offense, defense, drawing, HUD, versus hooks
 ├── net.js              PeerJS rooms, message protocol, clock sync, pose encode (no DOM)
@@ -54,7 +55,7 @@ Pin any new library to an exact version. Do not add a build step.
 ```powershell
 cd web; ..\.venv\Scripts\python.exe -m http.server 8000   # then open http://localhost:8000
 ```
-Any static host works (GitHub Pages, Netlify, Vercel). `getUserMedia` needs **`localhost` or HTTPS**.
+Any static host works. `getUserMedia` needs **`localhost` or HTTPS**. The public site is GitHub Pages; see Deploying below.
 
 Open `http://localhost:8000/?bot=1` to fight the in-page bot (no second camera). Create room / Join room uses PeerJS's public signaling server.
 
@@ -75,7 +76,17 @@ node web/tools/check_pipeline.mjs                    # assert pipeline.js tensor
 - The venv pins `onnx==1.17.0`, because newer `onnx` needs protobuf ≥ 6, which breaks `mediapipe==0.10.21`.
 - Do **not** change `pipeline.js`, `punchDetector.js`, or `punch_model.onnx` for a versus change. Re-export only when the model or the Python pipeline changes.
 
-**TURN.** `net.js` ships with STUN only (`stun.l.google.com:19302` and `stun.global.stun.twilio.com:3478`). Strict NATs often fail to open a data channel without a relay. Append `{urls, username, credential}` objects to the `TURN_SERVERS` array at the top of `net.js`. Nothing in the repo contains TURN credentials.
+**TURN.** `net.js` ships with STUN only (`stun.l.google.com:19302` and `stun.global.stun.twilio.com:3478`). Strict NATs often fail to open a data channel without a relay. Append `{urls, username, credential}` objects to the `TURN_SERVERS` array at the top of `net.js`. Nothing in the repo contains TURN credentials. The same limit applies on the public Pages site: two machines on strict networks may not connect until `TURN_SERVERS` is filled in.
+
+### Deploying
+
+The game is a static site in `web/`. GitHub Pages serves it over HTTPS, which is what `getUserMedia` needs when the players are not on localhost.
+
+1. In the repo, open **Settings → Pages** and set **Source** to **GitHub Actions**.
+2. Merge to `main`. `.github/workflows/pages.yml` also runs from the Actions tab (**Run workflow**).
+3. The site is https://jwiriadinata.github.io/BDBIGrokathon/ — solo at that URL, the bot at `?bot=1`.
+
+The workflow uploads the `web/` folder, including `web/.nojekyll` (so Pages does not run Jekyll) and `punch_model.onnx` (~22 MB, committed as a normal file, under GitHub's 100 MB file limit). Local assets are relative to the page (`game.js`, `./pipeline.js`, `punch_model.onnx`), so they resolve under the `/BDBIGrokathon/` project path. MediaPipe, ONNX Runtime, and PeerJS stay on their pinned CDN URLs.
 
 ---
 
