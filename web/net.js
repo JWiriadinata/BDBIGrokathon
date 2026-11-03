@@ -9,7 +9,7 @@
 // without a relay. Append `{urls, username, credential}` entries to
 // TURN_SERVERS (nothing is shipped with credentials). See web/CODEBASE.md.
 
-import { DAMAGE, POSE_HZ } from "./versus.js";
+import { POSE_HZ } from "./versus.js";
 
 export const PROTOCOL_VERSION = 1;
 export const ROOM_PREFIX = "pp-";
@@ -18,8 +18,6 @@ export const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export const TURN_SERVERS = [];
 
 export const POSE_INDICES = [0, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
-const VALID_KINDS = new Set(Object.keys(DAMAGE));
-const MULT_MIN = 0.5, MULT_MAX = 1.5;
 const PING_BURST = 8, PING_GAP_MS = 100, RESYNC_EVERY_MS = 5000, RESYNC_PINGS = 3;
 const BEST_SAMPLE_MAX_AGE_S = 30;
 
@@ -100,12 +98,6 @@ export function noteClockSample(state, sample, now) {
   state.offset = sample.offset;
   state.bestAt = now;
   return true;
-}
-
-export function clampMult(mult) {
-  const n = Number(mult);
-  if (!Number.isFinite(n)) return null;
-  return Math.min(MULT_MAX, Math.max(MULT_MIN, n));
 }
 
 function sleep(ms) {
@@ -443,12 +435,9 @@ export class Net extends EventTarget {
   }
 
   _onAttack(msg) {
-    if (!VALID_KINDS.has(msg.kind)) return;
-    const mult = clampMult(msg.mult);
-    if (mult === null) return;
-    this.emit("attack", {
-      id: msg.id, kind: msg.kind, mult, sentAt: Number(msg.sentAt) || 0,
-    });
+    // One attack shape. `kind` and `mult` are ignored if an older client still sends them.
+    if (msg.id == null) return;
+    this.emit("attack", { id: msg.id, sentAt: Number(msg.sentAt) || 0 });
   }
 
   _handlePose(raw) {

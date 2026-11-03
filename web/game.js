@@ -7,8 +7,9 @@ import { PunchDetector, GUARD_READY_SAMPLES } from "./punchDetector.js";
 // VERSUS: networking and round rules. Solo never constructs a Net.
 import { Net } from "./net.js";
 import {
-  Versus, BotOpponent, VERSUS_RESPAWN_DELAY_S, BLOCK_SCORE, LANDED_BONUS, OPP_PANEL_W_FRAC,
+  Versus, BotOpponent, BLOCK_SCORE, LANDED_BONUS,
   hitDamage, blockDamage, enqueueAttack, judge, verdictTitle,
+  mapCamPoint, mapCamRadius, pipRect,
 } from "./versus.js";
 
 // ── Game config (same values as main_python_analysis.py) ─────────────────────
@@ -320,24 +321,22 @@ const defense = {
   },
   activeWindow() { return this.attack ? [this.attack.activeStart, this.attack.activeEnd] : null; },
   // VERSUS: cap the queue at 2. The overflow is reported immediately and discarded.
-  enqueue(kind, meta) {
-    if (!enqueueAttack(this.queue, { kind, meta })) {
+  enqueue(meta) {
+    if (!enqueueAttack(this.queue, { meta })) {
       this.onDropped?.(meta);
       return false;
     }
     return true;
   },
   update(lms, now, reserved) {
-    // VERSUS: the random spawn timer is off. Pull the queue when the active window is free.
+    // VERSUS: one head-circle per queued punch. No random timer and no punch-target windows.
     if (GAME_MODE === "versus") {
       if (!this.attack && this.queue.length && lms) {
-        const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
-        if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) {
-          const item = this.queue.shift();
-          this.attack = spawnAttack(lms, now, item.kind);
-          this.attack.meta = item.meta;
-          this.banner = { text: `INCOMING ${LABELS[item.kind] || item.kind}`, until: this.attack.activeStart };
-        }
+        const item = this.queue.shift();
+        this.attack = spawnAttack(lms, now, "jab");
+        this.attack.meta = item.meta;
+        this.banner = { text: "INCOMING", until: this.attack.activeStart };
+        versus?.armHandCue(now);
       }
     } else {
       if (this.nextSpawn === null) this.nextSpawn = now + FIRST_ATTACK_DELAY_S;
@@ -358,7 +357,7 @@ const defense = {
       if (GAME_MODE !== "versus") this.nextSpawn = now + rand(...SPAWN_DELAY_RANGE);
       this.attack = null;
     }
-    a.draw(now);
+    if (GAME_MODE !== "versus") a.draw(now);
     return outcome;
   },
 };
@@ -602,8 +601,6 @@ function stepRound(lms, now, events) {
       st.timing[grade.toLowerCase()] += 1;
       st.score += grade === "PERFECT" ? SCORE_PERFECT : SCORE_GOOD;
       st.texts.push({ text: grade, pos: st.center, color: GRADE_COLORS[grade], born: now, scale: grade === "PERFECT" ? 1.4 : 1.2 });
-      // VERSUS: PERFECT / GOOD launches the called punch (not the CNN label) at the opponent.
-      if (GAME_MODE === "versus" && versus) versus.launchAttack(st.type, grade);
       if (punch) requestPrediction(st, st.type, st.side, segmentClip(punch.startT, punch.endT) ?? snapshotClip(st.spawnTs));
       else st.pending = { type: st.type, side: st.side, spawnTs: st.spawnTs, deadline: now + PENDING_CLASSIFY_S };
     } else if (missed) {
@@ -611,18 +608,13 @@ function stepRound(lms, now, events) {
       st.texts.push({ text: "MISS", pos: st.center, color: GRADE_COLORS.MISS, born: now, scale: 1.1 });
     }
     if (hit || missed) {
-      // VERSUS: shorter gap between prompts. Solo stays on TARGET_RESPAWN_DELAY_S.
-      const gap = GAME_MODE === "versus" ? VERSUS_RESPAWN_DELAY_S : TARGET_RESPAWN_DELAY_S;
-      Object.assign(st, { phase: "idle", center: null, type: null, side: null, nextSpawn: now + gap });
+      Object.assign(st, { phase: "idle", center: null, type: null, side: null, nextSpawn: now + TARGET_RESPAWN_DELAY_S });
     }
   }
 
   // 4. Defense (drawn first so the punch target stays on top of an attack band).
   const outcome = defense.update(lms, now, st.reserved);
-  // VERSUS: block is half damage and +25. Solo still gives +50 for a dodge or a block.
-  if (GAME_MODE === "versus") {
-    if (outcome) applyVersusDefense(outcome, now);
-  } else if (outcome === "Hit") {
+  if (outcome === "Hit") {
     st.score = Math.max(0, st.score - SCORE_HIT_PENALTY);
     st.vignetteUntil = now + HIT_VIGNETTE_S;
     st.texts.push({ text: "HIT!", pos: defense.lastEvent.pos, color: [255, 60, 60], born: now, scale: 1.2 });
@@ -644,9 +636,7 @@ function drawRoundText(now) {
   for (const t of st.texts) {
     const k = (now - t.born) / FLOATING_TEXT_S, pop = 1 + 0.25 * Math.max(0, 1 - k / 0.2);
     ctx.font = `bold ${32 * S * t.scale * pop}px system-ui, sans-serif`;
-    // VERSUS: result text beside the opponent panel is already in screen space.
-    const x = t.screen ? t.pos[0] : mx(t.pos[0]);
-    textCentered(t.text, x, t.pos[1] - 60 * S * k, t.color, 1 - k * k);
+    textCentered(t.text, mx(t.pos[0]), t.pos[1] - 60 * S * k, t.color, 1 - k * k);
   }
   if (now < st.vignetteUntil) drawVignette((st.vignetteUntil - now) / HIT_VIGNETTE_S);
   if (st.prediction && now <= st.prediction.until) {
@@ -659,25 +649,7 @@ function drawRoundText(now) {
     ctx.strokeRect(W / 2 - tw / 2 - pad, y - th / 2 - pad, tw + 2 * pad, th + 2 * pad);
     textCentered(st.prediction.text, W / 2, y, st.prediction.color, 1, false);
   }
-  // VERSUS: HP bars replace the solo score pill. Solo still uses drawHud.
-  if (GAME_MODE === "versus" && versus) {
-    versus.drawHud(ctx, W, H, S, st.score, versus.remaining(now, st.start));
-    drawVersusBanners(now);
-  } else drawHud(st.score, MAX_RUNTIME - (now - st.start));
-}
-
-// VERSUS: "INCOMING …" sits on the attack (mirrored x). "ATTACK QUEUED" while one waits.
-function drawVersusBanners(now) {
-  if (defense.queue.length) {
-    ctx.font = `bold ${22 * S}px system-ui, sans-serif`;
-    textCentered("ATTACK QUEUED", W / 2, H * 0.08, [255, 180, 60]);
-  }
-  const b = defense.banner;
-  if (b && now < b.until) {
-    const anchor = defense.attack?.anchor;
-    ctx.font = `bold ${28 * S}px system-ui, sans-serif`;
-    textCentered(b.text, anchor ? mx(anchor[0]) : W / 2, anchor ? anchor[1] - 36 * S : H * 0.16, ATTACK_COLOR);
-  }
+  drawHud(st.score, MAX_RUNTIME - (now - st.start));
 }
 
 // Debug overlay for the punch detector: peak circles in camera coords (call under the mirror transform)…
@@ -730,12 +702,13 @@ function loop() {
     if (worldBuf.length > WORLD_BUFFER_FRAMES) worldBuf.shift();
   }
   const punchEvents = lms ? detector.update(now, lms) : [];
-  // VERSUS: heartbeat, pose-loss, buffer pruning. Image landmarks only — also during the lobby and countdown.
+  // VERSUS: the opponent fills the frame. Solo keeps the mirrored camera below.
   if (GAME_MODE === "versus" && versus && net) {
-    // VERSUS: during the countdown the previous round's score must not be re-published.
     const liveScore = mode === "countdown" || !st ? 0 : st.score;
     versus.tick(now, liveScore, mode === "playing");
     if (lms && versus.connected) net.sendPose(net.netNow(), lms);
+    drawVersusFrame(lms, now, punchEvents);
+    return;
   }
 
   // Shapes are drawn in camera coordinates under a mirror transform; text after, at mirrored x.
@@ -754,32 +727,121 @@ function loop() {
   if (SHOW_PUNCH_DEBUG) drawPunchState();
 
   if (mode === "countdown") {
-    // VERSUS: both clients count down toward the host's t0 on the shared clock.
-    if (GAME_MODE === "versus" && versus) {
-      const left = versus.t0 - net.netNow();
-      if (left <= 0) { mode = "playing"; newRound(versus.t0 - net.clockOffset); }
-      else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
-    } else {
-      const left = PRESTART_COUNTDOWN_S - (now - modeStart);
-      if (left <= 0) { mode = "playing"; newRound(now); }
-      else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
-    }
+    const left = PRESTART_COUNTDOWN_S - (now - modeStart);
+    if (left <= 0) { mode = "playing"; newRound(now); }
+    else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
   }
   if (mode === "playing") {
     drawRoundText(now);
-    if (GAME_MODE === "versus" && versus) {
-      // VERSUS: 60 s on the shared clock, or a KO from applyVersusDefense. The display pauses while the pose is stale.
-      if (versus.timeUp(now, st.start)) {
-        versus.sendState(st.score);
-        finishVersus(verdictTitle(judge(versus.hp, versus.oppHp, st.score, versus.oppScore)));
-      }
-    } else if (now - st.start >= MAX_RUNTIME) endRound();
+    if (now - st.start >= MAX_RUNTIME) endRound();
   }
-  // VERSUS: opponent panel is unmirrored (raw camera x), after the mirrored block.
-  if (GAME_MODE === "versus" && versus) {
-    versus.drawOpponent(ctx, W, H, S);
-    if (mode === "over") versus.drawResult(ctx, W, H, S);
+}
+
+// VERSUS: a detected punch from either hand is one head-circle attack. No callout or target.
+function stepVersus(lms, now, events) {
+  if (events.some((e) => e.type === "punch")) versus.notePunch(now);
+  const outcome = defense.update(lms, now, []);
+  if (outcome) applyVersusDefense(outcome, now);
+}
+
+// The circle uses the same selfie mapping on the full frame and in the thumbnail,
+// so the picture the player dodges is the circle collision tests on their head.
+function drawMappedJab(atk, now, rect) {
+  if (!atk?.circle) return;
+  const [cx, cy, r] = atk.circle;
+  const [x, y] = mapCamPoint(cx, cy, W, H, rect);
+  const rr = Math.max(4, mapCamRadius(r, W, rect));
+  const phase = atk.phase(now);
+  if (phase === "done") return;
+  if (phase === "warning") {
+    if (atk.flashOn(now)) fillCircle(x, y, rr, rgba(ATTACK_COLOR, ATTACK_WARNING_ALPHA));
+    strokeCircle(x, y, rr, rgba(WHITE, 0.75), Math.max(2, rr / 18));
+  } else {
+    fillCircle(x, y, rr, rgba(ATTACK_COLOR, 0.9));
+    strokeCircle(x, y, rr * 0.55, rgba(WHITE, 0.9), Math.max(2, rr / 16));
+    strokeCircle(x, y, rr, rgba(WHITE, 0.95), Math.max(3, rr / 12));
   }
+}
+
+function drawLocalPip(lms, now) {
+  const pip = pipRect(W, H);
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(pip.x, pip.y, pip.w, pip.h);
+  ctx.clip();
+  ctx.setTransform(-pip.w / W, 0, 0, pip.h / H, pip.x + pip.w, pip.y);
+  ctx.drawImage(video, 0, 0, W, H);
+  if (lms) {
+    const shown = (l) => (l.visibility ?? 1) >= 0.5 && l.x >= 0 && l.x <= 1 && l.y >= 0 && l.y <= 1;
+    drawing.drawConnectors(lms, PoseLandmarker.POSE_CONNECTIONS.filter((c) => shown(lms[c.start]) && shown(lms[c.end])),
+                           { color: "#f5f5f5", lineWidth: 2 });
+    drawing.drawLandmarks(lms.filter(shown), { color: "#ff3030", radius: 2 });
+  }
+  ctx.restore();
+  if (defense.attack) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(pip.x, pip.y, pip.w, pip.h);
+    ctx.clip();
+    drawMappedJab(defense.attack, now, pip);
+    ctx.restore();
+  }
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,0.9)";
+  ctx.lineWidth = 2;
+  ctx.strokeRect(pip.x + 1, pip.y + 1, pip.w - 2, pip.h - 2);
+  ctx.font = `bold ${14 * S}px system-ui, sans-serif`;
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "top";
+  ctx.fillText("You", pip.x + 8 * S, pip.y + 6 * S);
+  ctx.restore();
+}
+
+function drawVersusFrame(lms, now, punchEvents) {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (mode === "playing") stepVersus(lms, now, punchEvents);
+  ctx.fillStyle = "#0c0e14";
+  ctx.fillRect(0, 0, W, H);
+  versus.drawStage(ctx, W, H, S, now);
+  if (defense.attack) drawMappedJab(defense.attack, now, { x: 0, y: 0, w: W, h: H });
+  if (defense.queue.length) {
+    ctx.font = `bold ${22 * S}px system-ui, sans-serif`;
+    textCentered("ATTACK QUEUED", W / 2, H * 0.3, [255, 180, 60]);
+  }
+  if (defense.banner && now < defense.banner.until) {
+    ctx.font = `bold ${52 * S}px system-ui, sans-serif`;
+    textCentered("INCOMING", W / 2, H * 0.2, ATTACK_COLOR);
+  }
+  drawLocalPip(lms, now);
+  if (mode === "countdown") {
+    const left = versus.t0 - net.netNow();
+    if (left <= 0) { mode = "playing"; newRound(versus.t0 - net.clockOffset); }
+    else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
+  }
+  if (mode === "playing") {
+    drawVersusPlayText(now);
+    if (versus.timeUp(now, st.start)) {
+      versus.sendState(st.score);
+      finishVersus(verdictTitle(judge(versus.hp, versus.oppHp, st.score, versus.oppScore)));
+    }
+  }
+  if (mode === "over") versus.drawResult(ctx, W, H, S);
+}
+
+function drawVersusPlayText(now) {
+  st.texts = st.texts.filter((t) => now - t.born <= FLOATING_TEXT_S);
+  for (const t of st.texts) {
+    const k = (now - t.born) / FLOATING_TEXT_S, pop = 1 + 0.25 * Math.max(0, 1 - k / 0.2);
+    ctx.font = `bold ${36 * S * (t.scale || 1) * pop}px system-ui, sans-serif`;
+    textCentered(t.text, t.pos[0], t.pos[1] - 50 * S * k, t.color, 1 - k * k);
+  }
+  if (now < st.vignetteUntil) drawVignette((st.vignetteUntil - now) / HIT_VIGNETTE_S);
+  versus.drawHud(ctx, W, H, S, st.score, versus.remaining(now, st.start));
+}
+
+function versusScreenPos(camPos) {
+  return mapCamPoint(camPos[0], camPos[1], W, H, { x: 0, y: 0, w: W, h: H });
 }
 
 function showPanel(html, buttonText) {
@@ -841,7 +903,7 @@ function attachVersus(n, role, roomCode) {
     onStart(msg) { beginVersusCountdown(msg.t0); },
     onAttack(msg) {
       if (mode !== "playing" && mode !== "countdown") return;
-      defense.enqueue(msg.kind, { id: msg.id, kind: msg.kind, mult: msg.mult });
+      defense.enqueue({ id: msg.id });
     },
     onAttackResult(msg) { onVersusAttackResult(msg); },
     onKo(msg) { onVersusKo(msg); },
@@ -923,21 +985,20 @@ function finishVersus(title, reason = "") {
 
 function applyVersusDefense(outcome, now) {
   const meta = defense.lastEvent?.meta;
-  const kind = meta?.kind;
-  const mult = meta?.mult ?? 1;
+  const pos = versusScreenPos(defense.lastEvent.pos);
   let dmg = 0;
   if (outcome === "Dodge") {
     st.score += SCORE_DEFENSE_BONUS;
-    st.texts.push({ text: "DODGED!", pos: defense.lastEvent.pos, color: WHITE, born: now, scale: 1.2 });
+    st.texts.push({ text: "DODGED!", pos, color: WHITE, born: now, scale: 1.2 });
   } else if (outcome === "Block") {
-    dmg = blockDamage(kind, mult);
+    dmg = blockDamage();
     st.score += BLOCK_SCORE;
-    st.texts.push({ text: "BLOCKED!", pos: defense.lastEvent.pos, color: WHITE, born: now, scale: 1.2 });
+    st.texts.push({ text: "BLOCKED!", pos, color: WHITE, born: now, scale: 1.2 });
   } else if (outcome === "Hit") {
-    dmg = hitDamage(kind, mult);
+    dmg = hitDamage();
     st.score = Math.max(0, st.score - SCORE_HIT_PENALTY);
     st.vignetteUntil = now + HIT_VIGNETTE_S;
-    st.texts.push({ text: "HIT!", pos: defense.lastEvent.pos, color: [255, 60, 60], born: now, scale: 1.2 });
+    st.texts.push({ text: "HIT!", pos, color: [255, 60, 60], born: now, scale: 1.2 });
   }
   versus.applyDamage(dmg);
   if (meta && meta.id != null) net.sendEvent("attackResult", { id: meta.id, outcome, dmg });
@@ -957,11 +1018,9 @@ function onVersusAttackResult(msg) {
     : msg.outcome === "Dodge" ? "DODGED"
     : msg.outcome === "Block" ? "BLOCKED" : null;
   if (label) {
-    const pw = OPP_PANEL_W_FRAC * W, ph = pw * 9 / 16, margin = Math.max(12, W / 60);
     st.texts.push({
       text: label,
-      pos: [W - margin - pw / 2, H - margin - ph - 36 * S],
-      screen: true,
+      pos: [W * 0.5, H * 0.62],
       color: msg.outcome === "Hit" ? GRADE_COLORS.PERFECT : WHITE,
       born: performance.now() / 1000,
       scale: 1.05,
