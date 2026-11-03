@@ -34,6 +34,7 @@ const ATTACK_FLASH_COUNT = 3, ATTACK_WARNING_S = 0.9, ATTACK_ACTIVE_S = 1.0;
 const ATTACK_WARNING_ALPHA = 0.35, ATTACK_SWEEP_FRACTION = 0.5;
 const SPAWN_DELAY_RANGE = [3, 7], FIRST_ATTACK_DELAY_S = 2.0, RESERVED_MARGIN_S = 0.1, ARM_PADDING_PX = 20;
 const ATTACK_WEIGHTS = { jab: 0.4, hook: 0.35, uppercut: 0.25 };
+const ATTACK_QUEUE_MAX = 2, ATTACK_MIN_GAP_S = 0.4;   // versus mode: externally requested attacks
 const JAB_RADIUS_SW = 0.45, HOOK_BAND_HEIGHT_SW = 0.4, UPPERCUT_BAND_WIDTH_SW = 0.8;
 const HEAD_HALF_WIDTH_SW = 0.15, HEAD_TOP_SW = 0.35, HEAD_BOTTOM_SW = 0.15, MIN_SHOULDER_PX = 40;
 
@@ -239,10 +240,14 @@ class Attack {
   }
 }
 
-function spawnAttack(lms, now) {
+function spawnAttack(lms, now, forcedKind = null) {
   const p = posePoints(lms), kinds = Object.keys(ATTACK_WEIGHTS);
-  let r = Math.random(), kind = kinds[kinds.length - 1];
-  for (const k of kinds) { if (r < ATTACK_WEIGHTS[k]) { kind = k; break; } r -= ATTACK_WEIGHTS[k]; }
+  let kind = forcedKind;
+  if (!kind) {
+    let r = Math.random();
+    kind = kinds[kinds.length - 1];
+    for (const k of kinds) { if (r < ATTACK_WEIGHTS[k]) { kind = k; break; } r -= ATTACK_WEIGHTS[k]; }
+  }
   const { sw } = p, [nx, ny] = p.nose;
   if (kind === "jab") {
     const rad = Math.trunc(JAB_RADIUS_SW * sw);
@@ -270,12 +275,26 @@ function checkCollision(lms, attack, now) {
   return forearmRects(p).some((f) => rectsOverlap(f, guardZone) && shapeOverlapsRect(danger, f)) ? "Block" : "Hit";
 }
 
-const defense = {
-  reset() { this.attack = null; this.nextSpawn = null; this.lastEvent = null; this.stats = { blocked: 0, dodged: 0, hit: 0 }; },
+export const defense = {
+  // autoSpawn=false (versus mode): only attacks queued with enqueue() are thrown.
+  reset({ autoSpawn = true } = {}) {
+    this.attack = null; this.nextSpawn = null; this.lastEvent = null; this.stats = { blocked: 0, dodged: 0, hit: 0 };
+    this.autoSpawn = autoSpawn; this.queue = []; this.nextQueuedAt = 0;
+  },
+  // Queue an attack of a given kind (from the opponent). Max ATTACK_QUEUE_MAX waiting; extras are dropped.
+  enqueue(kind, meta = null) {
+    if (!(kind in ATTACK_WEIGHTS) || this.queue.length >= ATTACK_QUEUE_MAX) return false;
+    this.queue.push({ kind, meta });
+    return true;
+  },
   activeWindow() { return this.attack ? [this.attack.activeStart, this.attack.activeEnd] : null; },
   update(lms, now, reserved) {
     if (this.nextSpawn === null) this.nextSpawn = now + FIRST_ATTACK_DELAY_S;
-    if (!this.attack && lms && now >= this.nextSpawn) {
+    if (!this.attack && lms && this.queue.length && now >= this.nextQueuedAt) {
+      const q = this.queue.shift();
+      this.attack = spawnAttack(lms, now, q.kind);
+      this.attack.meta = q.meta;
+    } else if (this.autoSpawn && !this.attack && lms && now >= this.nextSpawn) {
       const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
       // If this would collide with a punch moment, try again next frame.
       if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) this.attack = spawnAttack(lms, now);
@@ -286,8 +305,9 @@ const defense = {
     if (!outcome && now >= a.activeEnd) outcome = "Dodge";
     if (outcome) {
       this.stats[{ Block: "blocked", Hit: "hit", Dodge: "dodged" }[outcome]] += 1;
-      this.lastEvent = { outcome, pos: a.anchor };
+      this.lastEvent = { outcome, pos: a.anchor, kind: a.kind, meta: a.meta ?? null };
       this.nextSpawn = now + rand(...SPAWN_DELAY_RANGE);
+      this.nextQueuedAt = now + ATTACK_MIN_GAP_S;
       this.attack = null;
     }
     a.draw(now);
