@@ -1,0 +1,8 @@
+{
+  "name": "perfect-punch",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server/index.js", "test": "node --test" },
+  "dependencies": { "ws": "^8.18.0" }
+}
