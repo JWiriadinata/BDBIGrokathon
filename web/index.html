@@ -10,11 +10,24 @@
     canvas { max-width: 100%; max-height: 100%; }
     /* Video is only a frame source for the canvas; kept rendered so browsers keep decoding it. */
     video { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
-    #panel { position: absolute; max-width: 28rem; margin: 1rem; padding: 1.5rem 2rem; text-align: center;
-             background: rgba(20, 20, 20, 0.88); border-radius: 12px; }
+    #panel { position: absolute; max-width: 34rem; max-height: 92%; overflow: auto; margin: 1rem; padding: 1.5rem 2rem;
+             text-align: center; background: rgba(20, 20, 20, 0.88); border-radius: 12px; }
     #panel h2 { margin-top: 0; }
-    #start { font: inherit; font-weight: 700; padding: 0.7rem 1.6rem; border: 0; border-radius: 8px;
-             background: #ffe600; color: #111; cursor: pointer; }
+    #panel p { line-height: 1.4; }
+    button, input { font: inherit; }
+    button { font-weight: 700; padding: 0.7rem 1.2rem; border: 0; border-radius: 8px; cursor: pointer; }
+    button.primary, #start { background: #ffe600; color: #111; }
+    button.secondary { background: #2c2c2c; color: #eee; }
+    button:disabled { opacity: 0.45; cursor: default; }
+    .actions, .join-row { display: flex; gap: 0.5rem; justify-content: center; flex-wrap: wrap; margin: 0.75rem 0; }
+    input { padding: 0.55rem 0.7rem; border-radius: 8px; border: 1px solid #444; background: #1b1b1b; color: #fff; }
+    #room-code { width: 6.5rem; text-transform: uppercase; letter-spacing: 0.18em; text-align: center; font-weight: 800; }
+    #code-value { font-size: 1.7rem; letter-spacing: 0.22em; }
+    label.name { display: block; margin: 0.8rem 0; color: #ccc; }
+    label.name input { margin-left: 0.4rem; width: 9rem; }
+    .msg { color: #ffb080; min-height: 1.2em; }
+    #bot-note { color: #9ad; font-size: 0.92rem; }
+    #copy { padding: 0.35rem 0.7rem; margin-left: 0.4rem; }
   </style>
 </head>
 <body>
@@ -23,9 +36,43 @@
     <canvas id="canvas" width="960" height="540"></canvas>
     <div id="panel" role="dialog" aria-live="polite">
       <div id="status">Loading…</div>
+      <div id="lobby" hidden>
+        <h2>Perfect Punch</h2>
+        <p>Stand back so your head, shoulders and hips are in view.</p>
+        <p>Hit targets with the called hand as the ring closes. Dodge or block the orange attacks.</p>
+        <p id="bot-note" hidden>Dev opponent is on (<code>?bot=1</code>). Fight the bot here, or play a solo round.</p>
+        <label class="name">Name <input id="player-name" maxlength="16" value="Player" autocomplete="nickname"></label>
+        <div class="actions">
+          <button id="solo" class="primary" type="button" disabled>Solo</button>
+          <button id="create" class="secondary" type="button" disabled>Create room</button>
+          <button id="fight-bot" class="secondary" type="button" hidden>Fight bot</button>
+        </div>
+        <div class="join-row">
+          <input id="room-code" maxlength="5" placeholder="CODE" autocapitalize="characters" autocomplete="off" disabled>
+          <button id="join" class="secondary" type="button" disabled>Join room</button>
+        </div>
+        <p id="lobby-msg" class="msg"></p>
+      </div>
+      <div id="room" hidden>
+        <h2>Versus</h2>
+        <p id="code-line">Room <strong id="code-value">-----</strong> <button id="copy" class="secondary" type="button">Copy</button></p>
+        <p id="bot-line" hidden>Practice vs the bot in this tab.</p>
+        <p id="room-status">Waiting for opponent…</p>
+        <p id="room-ping"></p>
+        <p id="ready-you">You: not ready</p>
+        <p id="ready-opp">Opponent: not ready</p>
+        <p id="wait-host" hidden>Waiting for host…</p>
+        <div class="actions">
+          <button id="ready" class="primary" type="button">Ready</button>
+          <button id="start-versus" class="primary" type="button" hidden>Start</button>
+          <button id="leave" class="secondary" type="button">Leave</button>
+        </div>
+      </div>
       <button id="start" hidden></button>
     </div>
   </main>
+  <!-- PeerJS 1.5.4 pinned. Exposes window.Peer before the module runs. -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
   <script type="module" src="game.js"></script>
 </body>
 </html>

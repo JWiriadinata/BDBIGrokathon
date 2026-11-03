@@ -4,6 +4,12 @@ import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdel
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs";
 import { CLASS_NAMES, CLIP_FRAMES, TARGET_FPS, normalizeSkeleton, extractLiveClip, mirrorSkeleton, buildTensor } from "./pipeline.js";
 import { PunchDetector, GUARD_READY_SAMPLES } from "./punchDetector.js";
+// VERSUS: networking and round rules. Solo never constructs a Net.
+import { Net } from "./net.js";
+import {
+  Versus, BotOpponent, VERSUS_RESPAWN_DELAY_S, BLOCK_SCORE, LANDED_BONUS, OPP_PANEL_W_FRAC,
+  hitDamage, blockDamage, enqueueAttack, judge, verdictTitle,
+} from "./versus.js";
 
 // ── Game config (same values as main_python_analysis.py) ─────────────────────
 const STANCE = "orthodox";
@@ -59,8 +65,35 @@ const ctx = canvas.getContext("2d");
 const panel = document.getElementById("panel");
 const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start");
+// VERSUS: lobby / room controls. Solo still uses the same panel shell.
+const lobbyEl = document.getElementById("lobby");
+const roomEl = document.getElementById("room");
+const lobbyMsg = document.getElementById("lobby-msg");
+const botNote = document.getElementById("bot-note");
+const soloBtn = document.getElementById("solo");
+const createBtn = document.getElementById("create");
+const joinBtn = document.getElementById("join");
+const fightBotBtn = document.getElementById("fight-bot");
+const nameInput = document.getElementById("player-name");
+const codeInput = document.getElementById("room-code");
+const codeLine = document.getElementById("code-line");
+const codeValue = document.getElementById("code-value");
+const botLine = document.getElementById("bot-line");
+const copyBtn = document.getElementById("copy");
+const roomStatus = document.getElementById("room-status");
+const roomPing = document.getElementById("room-ping");
+const readyYou = document.getElementById("ready-you");
+const readyOpp = document.getElementById("ready-opp");
+const waitHost = document.getElementById("wait-host");
+const readyBtn = document.getElementById("ready");
+const startVersusBtn = document.getElementById("start-versus");
+const leaveBtn = document.getElementById("leave");
 let W = 960, H = 540, S = 1;
 let landmarker, session, drawing;
+// VERSUS: "solo" keeps the original round. "versus" is the online (or ?bot=1) fight.
+let GAME_MODE = "solo";
+let net = null, versus = null, connecting = false;
+const BOT_MODE = new URLSearchParams(location.search).get("bot") === "1";
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 const rgba = (c, a = 1, k = 1) => `rgba(${c[0] * k | 0},${c[1] * k | 0},${c[2] * k | 0},${a})`;
@@ -239,10 +272,15 @@ class Attack {
   }
 }
 
-function spawnAttack(lms, now) {
+function spawnAttack(lms, now, forcedKind = null) {
   const p = posePoints(lms), kinds = Object.keys(ATTACK_WEIGHTS);
-  let r = Math.random(), kind = kinds[kinds.length - 1];
-  for (const k of kinds) { if (r < ATTACK_WEIGHTS[k]) { kind = k; break; } r -= ATTACK_WEIGHTS[k]; }
+  // VERSUS: a queued attack passes its kind. Solo still rolls ATTACK_WEIGHTS; only the sweep direction is random.
+  let kind = forcedKind;
+  if (!kind) {
+    let r = Math.random();
+    kind = kinds[kinds.length - 1];
+    for (const k of kinds) { if (r < ATTACK_WEIGHTS[k]) { kind = k; break; } r -= ATTACK_WEIGHTS[k]; }
+  }
   const { sw } = p, [nx, ny] = p.nose;
   if (kind === "jab") {
     const rad = Math.trunc(JAB_RADIUS_SW * sw);
@@ -271,14 +309,43 @@ function checkCollision(lms, attack, now) {
 }
 
 const defense = {
-  reset() { this.attack = null; this.nextSpawn = null; this.lastEvent = null; this.stats = { blocked: 0, dodged: 0, hit: 0 }; },
+  queue: [],
+  banner: null,
+  onDropped: null,
+  // keepQueue: a versus countdown can receive attacks that belong to the round about to start.
+  reset(opts = {}) {
+    this.attack = null; this.nextSpawn = null; this.lastEvent = null; this.banner = null;
+    this.stats = { blocked: 0, dodged: 0, hit: 0 };
+    if (!opts.keepQueue) this.queue = [];
+  },
   activeWindow() { return this.attack ? [this.attack.activeStart, this.attack.activeEnd] : null; },
+  // VERSUS: cap the queue at 2. The overflow is reported immediately and discarded.
+  enqueue(kind, meta) {
+    if (!enqueueAttack(this.queue, { kind, meta })) {
+      this.onDropped?.(meta);
+      return false;
+    }
+    return true;
+  },
   update(lms, now, reserved) {
-    if (this.nextSpawn === null) this.nextSpawn = now + FIRST_ATTACK_DELAY_S;
-    if (!this.attack && lms && now >= this.nextSpawn) {
-      const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
-      // If this would collide with a punch moment, try again next frame.
-      if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) this.attack = spawnAttack(lms, now);
+    // VERSUS: the random spawn timer is off. Pull the queue when the active window is free.
+    if (GAME_MODE === "versus") {
+      if (!this.attack && this.queue.length && lms) {
+        const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
+        if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) {
+          const item = this.queue.shift();
+          this.attack = spawnAttack(lms, now, item.kind);
+          this.attack.meta = item.meta;
+          this.banner = { text: `INCOMING ${LABELS[item.kind] || item.kind}`, until: this.attack.activeStart };
+        }
+      }
+    } else {
+      if (this.nextSpawn === null) this.nextSpawn = now + FIRST_ATTACK_DELAY_S;
+      if (!this.attack && lms && now >= this.nextSpawn) {
+        const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
+        // If this would collide with a punch moment, try again next frame.
+        if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) this.attack = spawnAttack(lms, now);
+      }
     }
     const a = this.attack;
     if (!a) return null;
@@ -286,8 +353,9 @@ const defense = {
     if (!outcome && now >= a.activeEnd) outcome = "Dodge";
     if (outcome) {
       this.stats[{ Block: "blocked", Hit: "hit", Dodge: "dodged" }[outcome]] += 1;
-      this.lastEvent = { outcome, pos: a.anchor };
-      this.nextSpawn = now + rand(...SPAWN_DELAY_RANGE);
+      this.lastEvent = { outcome, pos: a.anchor, meta: a.meta || null };
+      // VERSUS: the next attack comes from the opponent, not a random delay.
+      if (GAME_MODE !== "versus") this.nextSpawn = now + rand(...SPAWN_DELAY_RANGE);
       this.attack = null;
     }
     a.draw(now);
@@ -396,7 +464,12 @@ const detector = new PunchDetector({
 });
 
 function newRound(now) {
-  defense.reset();
+  // VERSUS: attacks that arrived during the countdown belong to this round.
+  defense.reset({ keepQueue: GAME_MODE === "versus" });
+  if (GAME_MODE === "versus" && versus) {
+    versus.resetRound();
+    net?.setLive?.(true);
+  }
   st = {
     start: now, score: 0, phase: "idle", type: null, side: null, center: null, spawnTs: 0, idealTs: 0,
     calloutTs: 0, nextSpawn: 0, handInsidePrev: true, recent: [], reserved: [], texts: [], vignetteUntil: 0,
@@ -529,6 +602,8 @@ function stepRound(lms, now, events) {
       st.timing[grade.toLowerCase()] += 1;
       st.score += grade === "PERFECT" ? SCORE_PERFECT : SCORE_GOOD;
       st.texts.push({ text: grade, pos: st.center, color: GRADE_COLORS[grade], born: now, scale: grade === "PERFECT" ? 1.4 : 1.2 });
+      // VERSUS: PERFECT / GOOD launches the called punch (not the CNN label) at the opponent.
+      if (GAME_MODE === "versus" && versus) versus.launchAttack(st.type, grade);
       if (punch) requestPrediction(st, st.type, st.side, segmentClip(punch.startT, punch.endT) ?? snapshotClip(st.spawnTs));
       else st.pending = { type: st.type, side: st.side, spawnTs: st.spawnTs, deadline: now + PENDING_CLASSIFY_S };
     } else if (missed) {
@@ -536,13 +611,18 @@ function stepRound(lms, now, events) {
       st.texts.push({ text: "MISS", pos: st.center, color: GRADE_COLORS.MISS, born: now, scale: 1.1 });
     }
     if (hit || missed) {
-      Object.assign(st, { phase: "idle", center: null, type: null, side: null, nextSpawn: now + TARGET_RESPAWN_DELAY_S });
+      // VERSUS: shorter gap between prompts. Solo stays on TARGET_RESPAWN_DELAY_S.
+      const gap = GAME_MODE === "versus" ? VERSUS_RESPAWN_DELAY_S : TARGET_RESPAWN_DELAY_S;
+      Object.assign(st, { phase: "idle", center: null, type: null, side: null, nextSpawn: now + gap });
     }
   }
 
   // 4. Defense (drawn first so the punch target stays on top of an attack band).
   const outcome = defense.update(lms, now, st.reserved);
-  if (outcome === "Hit") {
+  // VERSUS: block is half damage and +25. Solo still gives +50 for a dodge or a block.
+  if (GAME_MODE === "versus") {
+    if (outcome) applyVersusDefense(outcome, now);
+  } else if (outcome === "Hit") {
     st.score = Math.max(0, st.score - SCORE_HIT_PENALTY);
     st.vignetteUntil = now + HIT_VIGNETTE_S;
     st.texts.push({ text: "HIT!", pos: defense.lastEvent.pos, color: [255, 60, 60], born: now, scale: 1.2 });
@@ -564,7 +644,9 @@ function drawRoundText(now) {
   for (const t of st.texts) {
     const k = (now - t.born) / FLOATING_TEXT_S, pop = 1 + 0.25 * Math.max(0, 1 - k / 0.2);
     ctx.font = `bold ${32 * S * t.scale * pop}px system-ui, sans-serif`;
-    textCentered(t.text, mx(t.pos[0]), t.pos[1] - 60 * S * k, t.color, 1 - k * k);
+    // VERSUS: result text beside the opponent panel is already in screen space.
+    const x = t.screen ? t.pos[0] : mx(t.pos[0]);
+    textCentered(t.text, x, t.pos[1] - 60 * S * k, t.color, 1 - k * k);
   }
   if (now < st.vignetteUntil) drawVignette((st.vignetteUntil - now) / HIT_VIGNETTE_S);
   if (st.prediction && now <= st.prediction.until) {
@@ -577,7 +659,25 @@ function drawRoundText(now) {
     ctx.strokeRect(W / 2 - tw / 2 - pad, y - th / 2 - pad, tw + 2 * pad, th + 2 * pad);
     textCentered(st.prediction.text, W / 2, y, st.prediction.color, 1, false);
   }
-  drawHud(st.score, MAX_RUNTIME - (now - st.start));
+  // VERSUS: HP bars replace the solo score pill. Solo still uses drawHud.
+  if (GAME_MODE === "versus" && versus) {
+    versus.drawHud(ctx, W, H, S, st.score, versus.remaining(now, st.start));
+    drawVersusBanners(now);
+  } else drawHud(st.score, MAX_RUNTIME - (now - st.start));
+}
+
+// VERSUS: "INCOMING …" sits on the attack (mirrored x). "ATTACK QUEUED" while one waits.
+function drawVersusBanners(now) {
+  if (defense.queue.length) {
+    ctx.font = `bold ${22 * S}px system-ui, sans-serif`;
+    textCentered("ATTACK QUEUED", W / 2, H * 0.08, [255, 180, 60]);
+  }
+  const b = defense.banner;
+  if (b && now < b.until) {
+    const anchor = defense.attack?.anchor;
+    ctx.font = `bold ${28 * S}px system-ui, sans-serif`;
+    textCentered(b.text, anchor ? mx(anchor[0]) : W / 2, anchor ? anchor[1] - 36 * S : H * 0.16, ATTACK_COLOR);
+  }
 }
 
 // Debug overlay for the punch detector: peak circles in camera coords (call under the mirror transform)…
@@ -603,26 +703,22 @@ function drawPunchState() {
   ctx.restore();
 }
 
-function showPanel(html, buttonText) {
-  statusEl.innerHTML = html;
-  startBtn.textContent = buttonText;
-  startBtn.hidden = !buttonText;
-  panel.hidden = false;
-}
-
 // Same as the end of the Python script: print the totals, release the camera, close the view.
 function endRound() {
   mode = "over";
   const d = defense.stats, t = st.timing;
   console.log(`Final score: ${st.score}  |  Timing - Perfect: ${t.perfect}, Good: ${t.good}, Miss: ${t.miss}`);
   console.log(`Defense stats - Blocked: ${d.blocked}, Dodged: ${d.dodged}, Hit: ${d.hit}`);
+  // VERSUS: the result card takes the place of a cleared canvas, and the camera stays up for a rematch.
+  if (GAME_MODE === "versus") return;
   video.srcObject.getTracks().forEach((track) => track.stop());
   ctx.clearRect(0, 0, W, H);
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
 function loop() {
-  if (mode === "over") return;
+  // VERSUS: keep drawing the result card. Solo still stops the loop when the round ends.
+  if (mode === "over" && GAME_MODE !== "versus") return;
   requestAnimationFrame(loop);
   if (video.readyState < 2 || video.currentTime === lastVideoTime) return;   // only new camera frames
   lastVideoTime = video.currentTime;
@@ -634,6 +730,13 @@ function loop() {
     if (worldBuf.length > WORLD_BUFFER_FRAMES) worldBuf.shift();
   }
   const punchEvents = lms ? detector.update(now, lms) : [];
+  // VERSUS: heartbeat, pose-loss, buffer pruning. Image landmarks only — also during the lobby and countdown.
+  if (GAME_MODE === "versus" && versus && net) {
+    // VERSUS: during the countdown the previous round's score must not be re-published.
+    const liveScore = mode === "countdown" || !st ? 0 : st.score;
+    versus.tick(now, liveScore, mode === "playing");
+    if (lms && versus.connected) net.sendPose(net.netNow(), lms);
+  }
 
   // Shapes are drawn in camera coordinates under a mirror transform; text after, at mirrored x.
   ctx.setTransform(-1, 0, 0, 1, W, 0);
@@ -651,20 +754,330 @@ function loop() {
   if (SHOW_PUNCH_DEBUG) drawPunchState();
 
   if (mode === "countdown") {
-    const left = PRESTART_COUNTDOWN_S - (now - modeStart);
-    if (left <= 0) { mode = "playing"; newRound(now); }
-    else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
+    // VERSUS: both clients count down toward the host's t0 on the shared clock.
+    if (GAME_MODE === "versus" && versus) {
+      const left = versus.t0 - net.netNow();
+      if (left <= 0) { mode = "playing"; newRound(versus.t0 - net.clockOffset); }
+      else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
+    } else {
+      const left = PRESTART_COUNTDOWN_S - (now - modeStart);
+      if (left <= 0) { mode = "playing"; newRound(now); }
+      else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
+    }
   }
   if (mode === "playing") {
     drawRoundText(now);
-    if (now - st.start >= MAX_RUNTIME) endRound();
+    if (GAME_MODE === "versus" && versus) {
+      // VERSUS: 60 s on the shared clock, or a KO from applyVersusDefense. The display pauses while the pose is stale.
+      if (versus.timeUp(now, st.start)) {
+        versus.sendState(st.score);
+        finishVersus(verdictTitle(judge(versus.hp, versus.oppHp, st.score, versus.oppScore)));
+      }
+    } else if (now - st.start >= MAX_RUNTIME) endRound();
+  }
+  // VERSUS: opponent panel is unmirrored (raw camera x), after the mirrored block.
+  if (GAME_MODE === "versus" && versus) {
+    versus.drawOpponent(ctx, W, H, S);
+    if (mode === "over") versus.drawResult(ctx, W, H, S);
   }
 }
 
-startBtn.addEventListener("click", () => {
+function showPanel(html, buttonText) {
+  lobbyEl.hidden = true;
+  roomEl.hidden = true;
+  statusEl.hidden = false;
+  statusEl.innerHTML = html;
+  startBtn.textContent = buttonText || "";
+  startBtn.hidden = !buttonText;
+  panel.hidden = false;
+}
+
+function showLobby() {
+  statusEl.hidden = true;
+  startBtn.hidden = true;
+  roomEl.hidden = true;
+  lobbyEl.hidden = false;
+  panel.hidden = false;
+  const ready = mode === "ready";
+  for (const el of [soloBtn, createBtn, joinBtn, codeInput]) el.disabled = !ready;
+  fightBotBtn.hidden = !BOT_MODE;
+  botNote.hidden = !BOT_MODE;
+  fightBotBtn.disabled = !ready;
+}
+
+function updateRoom() {
+  if (!versus) return;
+  const bot = versus.roomCode === "BOT";
+  codeLine.hidden = bot;
+  botLine.hidden = !bot;
+  if (!bot) codeValue.textContent = versus.roomCode || "-----";
+  roomStatus.textContent = versus.connected ? `Opponent connected: ${versus.oppName}` : "Waiting for opponent…";
+  roomPing.textContent = versus.pingMs == null ? "" : `ping ${versus.pingMs} ms`;
+  readyYou.textContent = `You: ${versus.localReady ? "Ready" : "not ready"}`;
+  readyOpp.textContent = `Opponent: ${versus.oppReady ? "Ready" : "not ready"}`;
+  readyBtn.textContent = versus.localReady ? "Cancel ready" : "Ready";
+  const both = versus.connected && versus.localReady && versus.oppReady;
+  const host = versus.role === "host";
+  startVersusBtn.hidden = !(host && both);
+  waitHost.hidden = host || !both;
+}
+
+function playerName() {
+  return (nameInput.value || "Player").trim().slice(0, 16) || "Player";
+}
+
+function makeNet() {
+  const n = new Net({ PeerCtor: globalThis.Peer, name: playerName(), W, H });
+  return n;
+}
+
+function attachVersus(n, role, roomCode) {
+  GAME_MODE = "versus";
+  net = n;
+  versus = new Versus(n, role, {
+    onOpen() { updateRoom(); },
+    onReady() { updateRoom(); },
+    onLatency() { updateRoom(); },
+    onStart(msg) { beginVersusCountdown(msg.t0); },
+    onAttack(msg) {
+      if (mode !== "playing" && mode !== "countdown") return;
+      defense.enqueue(msg.kind, { id: msg.id, kind: msg.kind, mult: msg.mult });
+    },
+    onAttackResult(msg) { onVersusAttackResult(msg); },
+    onKo(msg) { onVersusKo(msg); },
+    onBothRematch() { onBothRematch(); },
+    onLeft() { onOpponentLeft(); },
+    onError(msg) { onNetError(msg); },
+    onStaleDrop() { onOpponentLeft(); },
+  });
+  versus.myName = playerName();
+  versus.roomCode = roomCode;
+  defense.onDropped = (meta) => {
+    if (meta && meta.id != null && net) net.sendEvent("attackResult", { id: meta.id, outcome: "dropped", dmg: 0 });
+  };
+}
+
+function showRoom(code) {
+  statusEl.hidden = true;
+  startBtn.hidden = true;
+  lobbyEl.hidden = true;
+  roomEl.hidden = false;
+  panel.hidden = false;
+  if (versus) versus.roomCode = code;
+  updateRoom();
+}
+
+function teardownVersus() {
+  const n = net, v = versus;
+  if (n) n.ignoreClose = true;
+  try { v?.detach(); } catch { /* listener already gone */ }
+  try { n?.close(); } catch { /* already closed */ }
+  net = null;
+  versus = null;
+  defense.onDropped = null;
+  defense.queue = [];
+  defense.attack = null;
+  defense.banner = null;
+  GAME_MODE = "solo";
+  if (mode === "countdown" || mode === "playing" || mode === "over") mode = "ready";
+  showLobby();
+}
+
+function onOpponentLeft() {
+  if (!versus) return;
+  const forfeited = mode === "playing";
+  teardownVersus();
+  lobbyMsg.textContent = forfeited ? "Opponent left. You win by forfeit." : "Opponent left";
+}
+
+function onNetError(detail) {
+  const message = detail?.message || "Connection failed.";
+  if (versus || net) teardownVersus();
+  else showLobby();
+  lobbyMsg.textContent = message;
+}
+
+function beginVersusCountdown(t0) {
+  if (!versus || !net || !Number.isFinite(t0)) return;
+  versus.t0 = t0;
+  versus.resetRound();
+  defense.queue = [];
+  defense.attack = null;
+  defense.banner = null;
+  defense.lastEvent = null;
+  panel.hidden = true;
+  mode = "countdown";
+}
+
+function finishVersus(title, reason = "") {
+  if (!versus || versus._finished || !st) return;
+  versus._finished = true;
+  versus.result = {
+    title, reason,
+    myHp: versus.hp, oppHp: versus.oppHp,
+    myScore: st.score, oppScore: versus.oppScore,
+  };
+  net?.setLive?.(false);
+  endRound();
+}
+
+function applyVersusDefense(outcome, now) {
+  const meta = defense.lastEvent?.meta;
+  const kind = meta?.kind;
+  const mult = meta?.mult ?? 1;
+  let dmg = 0;
+  if (outcome === "Dodge") {
+    st.score += SCORE_DEFENSE_BONUS;
+    st.texts.push({ text: "DODGED!", pos: defense.lastEvent.pos, color: WHITE, born: now, scale: 1.2 });
+  } else if (outcome === "Block") {
+    dmg = blockDamage(kind, mult);
+    st.score += BLOCK_SCORE;
+    st.texts.push({ text: "BLOCKED!", pos: defense.lastEvent.pos, color: WHITE, born: now, scale: 1.2 });
+  } else if (outcome === "Hit") {
+    dmg = hitDamage(kind, mult);
+    st.score = Math.max(0, st.score - SCORE_HIT_PENALTY);
+    st.vignetteUntil = now + HIT_VIGNETTE_S;
+    st.texts.push({ text: "HIT!", pos: defense.lastEvent.pos, color: [255, 60, 60], born: now, scale: 1.2 });
+  }
+  versus.applyDamage(dmg);
+  if (meta && meta.id != null) net.sendEvent("attackResult", { id: meta.id, outcome, dmg });
+  versus.sendState(st.score);
+  if (versus.hp <= 0) {
+    net.sendEvent("ko", { loser: "me" });
+    finishVersus("YOU LOSE", "KO");
+  }
+}
+
+function onVersusAttackResult(msg) {
+  if (!versus) return;
+  const entry = versus.takeOutgoing(msg.id);
+  if (!entry || msg.outcome === "dropped" || !st) return;
+  if (msg.outcome === "Hit") st.score += LANDED_BONUS;
+  const label = msg.outcome === "Hit" ? `LANDED -${msg.dmg}`
+    : msg.outcome === "Dodge" ? "DODGED"
+    : msg.outcome === "Block" ? "BLOCKED" : null;
+  if (label) {
+    const pw = OPP_PANEL_W_FRAC * W, ph = pw * 9 / 16, margin = Math.max(12, W / 60);
+    st.texts.push({
+      text: label,
+      pos: [W - margin - pw / 2, H - margin - ph - 36 * S],
+      screen: true,
+      color: msg.outcome === "Hit" ? GRADE_COLORS.PERFECT : WHITE,
+      born: performance.now() / 1000,
+      scale: 1.05,
+    });
+  }
+  versus.sendState(st.score);
+}
+
+function onVersusKo(msg) {
+  if (!versus || versus._finished) return;
+  if (msg.loser === "me") { versus.oppHp = 0; finishVersus("YOU WIN", "KO"); }
+  else { versus.hp = 0; finishVersus("YOU LOSE", "KO"); }
+}
+
+function onBothRematch() {
+  if (!versus || versus.role !== "host" || !net) return;
+  const t0 = net.netNow() + 3.5;
+  net.sendEvent("start", { t0 });
+  beginVersusCountdown(t0);
+}
+
+function startBot() {
+  const bot = new BotOpponent();
+  attachVersus(bot, "host", "BOT");
+  showRoom("BOT");
+  bot.start();
+}
+
+soloBtn.addEventListener("click", () => {
+  if (mode !== "ready") return;
+  GAME_MODE = "solo";
   panel.hidden = true;
   mode = "countdown";
   modeStart = performance.now() / 1000;
+});
+
+createBtn.addEventListener("click", async () => {
+  if (mode !== "ready" || connecting) return;
+  if (typeof globalThis.Peer !== "function") { lobbyMsg.textContent = "PeerJS failed to load."; return; }
+  connecting = true;
+  lobbyMsg.textContent = "Creating room…";
+  const n = makeNet();
+  attachVersus(n, "host", "");
+  try {
+    const code = await n.host();
+    showRoom(code);
+    lobbyMsg.textContent = "";
+  } catch (e) {
+    teardownVersus();
+    lobbyMsg.textContent = e?.message || "Could not create room.";
+  } finally { connecting = false; }
+});
+
+joinBtn.addEventListener("click", async () => {
+  if (mode !== "ready" || connecting) return;
+  if (typeof globalThis.Peer !== "function") { lobbyMsg.textContent = "PeerJS failed to load."; return; }
+  const code = codeInput.value.toUpperCase().replace(/\s+/g, "").slice(0, 5);
+  if (code.length !== 5) { lobbyMsg.textContent = "Enter a 5-character code."; return; }
+  connecting = true;
+  lobbyMsg.textContent = "Joining room…";
+  const n = makeNet();
+  attachVersus(n, "guest", code);
+  try {
+    await n.join(code);
+    showRoom(code);
+    lobbyMsg.textContent = "";
+  } catch (e) {
+    teardownVersus();
+    lobbyMsg.textContent = e?.message || "Room not found.";
+  } finally { connecting = false; }
+});
+
+fightBotBtn.addEventListener("click", () => { if (mode === "ready") startBot(); });
+
+readyBtn.addEventListener("click", () => {
+  if (!versus || !net) return;
+  versus.localReady = !versus.localReady;
+  net.sendEvent("ready", { ready: versus.localReady });
+  updateRoom();
+});
+
+startVersusBtn.addEventListener("click", () => {
+  if (!versus || !net || versus.role !== "host" || !versus.localReady || !versus.oppReady) return;
+  const t0 = net.netNow() + 3.5;
+  net.sendEvent("start", { t0 });
+  beginVersusCountdown(t0);
+});
+
+leaveBtn.addEventListener("click", () => teardownVersus());
+
+copyBtn.addEventListener("click", async () => {
+  const code = codeValue.textContent.trim();
+  try {
+    await navigator.clipboard.writeText(code);
+    copyBtn.textContent = "Copied";
+    setTimeout(() => { copyBtn.textContent = "Copy"; }, 1200);
+  } catch { copyBtn.textContent = code; }
+});
+
+codeInput.addEventListener("input", () => {
+  const next = codeInput.value.toUpperCase().slice(0, 5);
+  if (next !== codeInput.value) codeInput.value = next;
+});
+codeInput.addEventListener("keydown", (e) => { if (e.key === "Enter") joinBtn.click(); });
+
+canvas.addEventListener("pointerdown", (ev) => {
+  // VERSUS: Rematch and Leave are drawn on the result card.
+  if (GAME_MODE !== "versus" || mode !== "over" || !versus) return;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const x = (ev.clientX - rect.left) * (canvas.width / rect.width);
+  const y = (ev.clientY - rect.top) * (canvas.height / rect.height);
+  const hit = versus.hitButton(x, y);
+  if (!hit) return;
+  if (hit.id === "rematch") { versus.requestRematch(); versus.drawResult(ctx, W, H, S); }
+  if (hit.id === "leave") teardownVersus();
 });
 
 async function init() {
@@ -690,8 +1103,9 @@ async function init() {
       ort.InferenceSession.create("punch_model.onnx", { executionProviders: ["wasm"] }),
     ]);
     mode = "ready";
-    showPanel(`<h2>Perfect Punch</h2><p>Stand back so your head, shoulders and hips are in view.</p>
-      <p>Hit targets with the called hand as the ring closes. Dodge or block the orange attacks.</p>`, "Start round");
+    // VERSUS: room buttons stay disabled until the camera and both models are ready. ?bot=1 opens the bot room.
+    if (BOT_MODE) startBot();
+    else showLobby();
     loop();
   } catch (e) {
     console.error(e);
