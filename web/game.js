@@ -38,7 +38,7 @@ const ATTACK_WEIGHTS = { jab: 0.4, hook: 0.35, uppercut: 0.25 };
 const ATTACK_QUEUE_MAX = 2, ATTACK_MIN_GAP_S = 0.4;   // versus mode: externally requested attacks
 const ATTACK_QUEUE_DROP_S = 3.0;   // versus: a queued attack that can't be placed (no pose) this long is dropped as a Dodge
 // Versus: only real, clear punches become attacks on the opponent.
-const VS_MIN_EXT = 1.0, VS_MIN_SPEED = 9, VS_MIN_VIS = 0.6;
+const VS_MIN_EXT = 0.85, VS_MIN_SPEED = 7.5, VS_MIN_VIS = 0.5, VS_MIN_CONF = 0.4;   // versus punch gates (detector base: ext 0.8, speed 7)
 const VS_IGNORE_ATTACKS_S = 2.0;   // incoming attacks are ignored this long after the match starts
 const VS_TILE_FRAC = 0.38;         // own-camera tile width (fraction of canvas) when the opponent's video is live
 const DEBUG = new URLSearchParams(location.search).has("debug");
@@ -644,7 +644,7 @@ async function punchKind(ev) {
       const conf = choosePunchSide(kind, false) === ev.side ? plain[i] : mirrored[i];
       if (conf > best[1]) best = [kind, conf];
     });
-    return best[0] && best[1] >= MODEL_CONF_THRESHOLD ? best : null;
+    return best[0] && best[1] >= VS_MIN_CONF ? best : null;
   } catch (e) { console.error("classify failed", e); return null; }
 }
 
