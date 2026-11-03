@@ -811,4 +811,7 @@ async function init() {
   }
 }
 
+// Debug/test hook (used by the headless two-browser test): inspect versus state, inject punches/outcomes.
+window.__pp = { V, defense, getMode: () => mode, isVersus: () => versus };
+
 init();
