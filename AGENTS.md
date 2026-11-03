@@ -17,7 +17,7 @@ Read `CLAUDE.md` first for how the single-player game works. This file covers **
 2. A synced countdown starts the match on both clients at the same time (within ~200 ms).
 3. When A throws a punch the detector recognises (`PunchDetector` event, optionally confirmed by the CNN), B's screen spawns the matching attack within ~300 ms: jab → jab circle at the head, hook → hook band, uppercut → uppercut band (shapes from `defense` in `web/game.js`).
 4. B's client decides Hit / Block / Dodge with the existing `checkCollision` logic and reports it. Both clients show the same outcome.
-5. Each player has a health bar (start 100). Hit = −10 (tunable), Block = −2, Dodge = 0. Both clients show the same health for both players.
+5. Each player has a health bar (start 100). Hit = −20 (tunable), Block = −5, Dodge = 0. Both clients show the same health for both players.
 6. Match ends at 0 health or after `MATCH_DURATION_S` (default 90 s). Both clients show the same winner screen with a rematch button.
 7. Disconnect handling: if a player drops, the other sees "Opponent disconnected" and returns to the lobby. No crash.
 8. Solo mode (current game) still starts and plays exactly as before.
@@ -62,6 +62,8 @@ Clock sync: on connect, the client does a few ping/pong exchanges (`ping {t}` �
 ## 3. MVP subtasks (file ownership and order)
 
 `web/game.js` is one 700-line file, so parallel implementers would collide. **T1 runs first and alone**; after it, T2–T5 can run in parallel because they own separate files.
+
+**Status (Nov 2):** T1 done in minimal form (no module split yet: `defense.enqueue`/`autoSpawn` added inside `web/game.js`); T2–T5 done (MVP: `server/`, `web/net.js`, `web/versus.js`, lobby in `index.html`, versus HUD in `game.js`); T6 partial (`server/test/`); T7 done (CLAUDE.md run steps). Remaining: full T1 module split, real two-webcam playtest.
 
 | ID | Subtask | Owns (may edit) | Depends on |
 |---|---|---|---|
