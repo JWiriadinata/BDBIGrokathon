@@ -4,7 +4,7 @@ export class Net {
     this.url = url; this.handlers = {}; this.offset = 0; this.bestRtt = Infinity; this.ws = null;
   }
   on(type, fn) { this.handlers[type] = fn; return this; }
-  send(type, body = {}) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ type, ...body })); }
+  send(type, body = {}) { if (this.ws?.readyState === 1) this.ws.send(JSON.stringify({ type, ...body })); }   // keep `type` first (server fast-path for frames)
   // Server epoch ms, estimated from the lowest-RTT ping/pong.
   serverNow() { return Date.now() + this.offset; }
   connect() {

@@ -39,6 +39,9 @@ const ATTACK_QUEUE_MAX = 2, ATTACK_MIN_GAP_S = 0.4;   // versus mode: externally
 const ATTACK_QUEUE_DROP_S = 3.0;   // versus: a queued attack that can't be placed (no pose) this long is dropped as a Dodge
 // Versus: only real, clear punches become attacks on the opponent.
 const VS_MIN_EXT = 1.0, VS_MIN_SPEED = 9, VS_MIN_VIS = 0.6;
+const VS_IGNORE_ATTACKS_S = 2.0;   // incoming attacks are ignored this long after the match starts
+const VS_TILE_FRAC = 0.38;         // own-camera tile width (fraction of canvas) when the opponent's video is live
+const DEBUG = new URLSearchParams(location.search).has("debug");
 const JAB_RADIUS_SW = 0.45, HOOK_BAND_HEIGHT_SW = 0.4, UPPERCUT_BAND_WIDTH_SW = 0.8;
 const HEAD_HALF_WIDTH_SW = 0.15, HEAD_TOP_SW = 0.35, HEAD_BOTTOM_SW = 0.15, MIN_SHOULDER_PX = 40;
 
@@ -675,6 +678,42 @@ function stepVersus(lms, now, events) {
   } else st.texts.push({ text: outcome === "Dodge" ? "DODGED!" : "BLOCKED!", pos: defense.lastEvent.pos, color: WHITE, born: now, scale: 1.2 });
 }
 
+// FaceTime layout: the frame drawn so far (own camera, skeleton, attacks) shrinks into a corner tile, and the
+// opponent's live video fills the main view, with the incoming attack echoed on it and a big warning label.
+let tileCanvas = null;
+function composeFaceTime(now) {
+  const tw = Math.round(W * VS_TILE_FRAC), th = Math.round(tw * H / W), m = Math.max(12, W / 60);
+  tileCanvas ??= document.createElement("canvas");
+  if (tileCanvas.width !== tw) Object.assign(tileCanvas, { width: tw, height: th });
+  tileCanvas.getContext("2d").drawImage(canvas, 0, 0, tw, th);
+  ctx.save();
+  ctx.setTransform(-1, 0, 0, 1, W, 0);   // opponent faces you: mirrored like a selfie view
+  ctx.drawImage(V.vs.oppImg, 0, 0, W, H);
+  const a = defense.attack;
+  if (a && a.phase(now) !== "done") { ctx.globalAlpha = 0.55; a.draw(now); }   // where it lands, echoed on the main view
+  ctx.restore();
+  if (a && a.phase(now) === "warning" && a.flashOn(now)) {
+    fitFont(`${LABELS[a.kind]}!`, W * 0.4, H * 0.16);
+    textCentered(`${LABELS[a.kind]}!`, W / 2, H * 0.42, ATTACK_COLOR);
+  }
+  const x = W - m - tw, y = H - m - th, r = Math.max(10, tw / 18);
+  ctx.save();
+  ctx.beginPath(); ctx.roundRect(x, y, tw, th, r); ctx.clip();
+  ctx.drawImage(tileCanvas, x, y);
+  ctx.restore();
+  ctx.strokeStyle = rgba(WHITE, 0.9); ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.roundRect(x, y, tw, th, r); ctx.stroke();
+  ctx.font = `bold ${14 * S}px system-ui, sans-serif`;
+  textCentered("YOU", x + 28 * S, y + 16 * S, WHITE);
+}
+
+function drawVsDebug() {
+  ctx.font = `bold ${16 * S}px system-ui, sans-serif`;
+  ctx.textAlign = "left"; ctx.fillStyle = "#ff0";
+  ctx.fillText(`debug: punches sent ${V.vs.sent} / attacks received ${V.vs.recv} / opp video ${V.oppVideoLive() ? "live" : "off"}`, 12 * S, H - 12 * S);
+  ctx.textAlign = "start";
+}
+
 function drawHealthBar(x1, y1, x2, y2, frac, name, alignRight) {
   pill(x1 - 6, y1 - 6, x2 + 6, y2 + 6);
   const w = (x2 - x1) * Math.max(0, Math.min(1, frac));
@@ -765,6 +804,8 @@ function loop() {
   if (mode === "playing") (versus ? stepVersus : stepRound)(lms, now, punchEvents);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (SHOW_PUNCH_DEBUG) drawPunchState();
+  if (versus && (mode === "countdown" || mode === "playing")) { V.sendFrame(video); if (V.oppVideoLive()) composeFaceTime(now); }
+  if (versus && DEBUG) drawVsDebug();
 
   if (mode === "countdown") {
     const left = versus ? V.countdownLeftS() : PRESTART_COUNTDOWN_S - (now - modeStart);
@@ -799,7 +840,9 @@ const vsCallbacks = {
       st.texts.push({ text: { Hit: "LANDED!", Block: "BLOCKED", Dodge: "DODGED" }[e.result], pos: [W / 2, H * 0.65],
                       color: e.result === "Hit" ? [255, 230, 0] : [200, 200, 200], born: now, scale: 1.3 });
   },
-  onAttack: (kind, attackId) => { if (versus && mode === "playing") defense.enqueue(kind, { attackId }); },
+  onAttack: (kind, attackId) => {
+    if (versus && mode === "playing" && performance.now() / 1000 - st.start >= VS_IGNORE_ATTACKS_S) defense.enqueue(kind, { attackId });
+  },
   onEnd: (text) => {
     mode = "ready"; defense.reset();
     statusEl.innerHTML = `<h2>${text}</h2>`;

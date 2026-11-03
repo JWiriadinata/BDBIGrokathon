@@ -23,10 +23,13 @@ const server = http.createServer(async (req, res) => {
 });
 
 const lobby = new Lobby();
-const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 4096 });
+const wss = new WebSocketServer({ server, path: "/ws", maxPayload: 128 * 1024 });
 wss.on("connection", (ws) => {
   const player = { id: `p${lobby.nextId++}`, name: "Player", room: null,
-                   send: (m) => { if (ws.readyState === 1) ws.send(JSON.stringify(m)); } };
+                   // Video frames are skipped when the socket is backed up, so game messages never queue behind them.
+                   send: (m, droppable = false) => {
+                     if (ws.readyState === 1 && !(droppable && ws.bufferedAmount > 512 * 1024)) ws.send(JSON.stringify(m));
+                   } };
   ws.on("message", (data, isBinary) => {
     if (isBinary) return;
     if (!lobby.handle(player, data.toString())) player.send({ type: "error", reason: "rejected" });

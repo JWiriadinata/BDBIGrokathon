@@ -3,6 +3,7 @@ export const START_HEALTH = 100;
 export const DAMAGE = { Hit: 20, Block: 5, Dodge: 0 };
 export const MATCH_DURATION_S = 90, COUNTDOWN_MS = 3000, PUNCH_MIN_GAP_MS = 600;
 export const KINDS = ["jab", "hook", "uppercut"];
+export const MAX_MSG = 4096, MAX_FRAME = 120000, FRAME_MIN_GAP_MS = 60;   // video frames: JPEG data URLs, ~10 fps
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 export class Lobby {
@@ -115,11 +116,24 @@ export class Lobby {
     if (room.players.length === 0) this.rooms.delete(room.code);
   }
 
+  // Relays one webcam frame to the opponent (rate-limited; JPEG data URLs only).
+  frame(player, msg) {
+    const opp = this.opponent(player), t = this.now();
+    if (!opp || typeof msg.d !== "string" || !msg.d.startsWith("data:image/jpeg;base64,") || msg.d.length > MAX_FRAME) return false;
+    if (t - (player.lastFrame ?? -Infinity) < FRAME_MIN_GAP_MS) return true;   // drop silently
+    player.lastFrame = t;
+    opp.send({ type: "frame", d: msg.d }, true);
+    return true;
+  }
+
   // Validates and dispatches one raw message. Returns false if rejected.
   handle(player, raw) {
-    if (typeof raw !== "string" || raw.length > 4096) return false;
+    if (typeof raw !== "string" || raw.length > MAX_FRAME + 64) return false;
+    const isFrame = raw.startsWith('{"type":"frame"');
+    if (!isFrame && raw.length > MAX_MSG) return false;
     let msg;
     try { msg = JSON.parse(raw); } catch { return false; }
+    if (isFrame) return this.frame(player, msg);
     if (!msg || typeof msg !== "object") return false;
     const name = (n) => String(n ?? "Player").slice(0, 24);
     switch (msg.type) {
