@@ -36,6 +36,9 @@ const ATTACK_WARNING_ALPHA = 0.35, ATTACK_SWEEP_FRACTION = 0.5;
 const SPAWN_DELAY_RANGE = [3, 7], FIRST_ATTACK_DELAY_S = 2.0, RESERVED_MARGIN_S = 0.1, ARM_PADDING_PX = 20;
 const ATTACK_WEIGHTS = { jab: 0.4, hook: 0.35, uppercut: 0.25 };
 const ATTACK_QUEUE_MAX = 2, ATTACK_MIN_GAP_S = 0.4;   // versus mode: externally requested attacks
+const ATTACK_QUEUE_DROP_S = 3.0;   // versus: a queued attack that can't be placed (no pose) this long is dropped as a Dodge
+// Versus: only real, clear punches become attacks on the opponent.
+const VS_MIN_EXT = 1.0, VS_MIN_SPEED = 9, VS_MIN_VIS = 0.6;
 const JAB_RADIUS_SW = 0.45, HOOK_BAND_HEIGHT_SW = 0.4, UPPERCUT_BAND_WIDTH_SW = 0.8;
 const HEAD_HALF_WIDTH_SW = 0.15, HEAD_TOP_SW = 0.35, HEAD_BOTTOM_SW = 0.15, MIN_SHOULDER_PX = 40;
 
@@ -296,21 +299,25 @@ export const defense = {
       const q = this.queue.shift();
       this.attack = spawnAttack(lms, now, q.kind);
       this.attack.meta = q.meta;
+      this.attack.external = true;
     } else if (this.autoSpawn && !this.attack && lms && now >= this.nextSpawn) {
       const start = now + ATTACK_WARNING_S, end = start + ATTACK_ACTIVE_S;
       // If this would collide with a punch moment, try again next frame.
       if (!reserved.some(([a, b]) => start < b + RESERVED_MARGIN_S && end > a - RESERVED_MARGIN_S)) this.attack = spawnAttack(lms, now);
     }
-    // Versus: a queued attack that can't be placed because no pose is visible (player out of frame) lands.
-    if (!this.attack && !lms && this.queue.length && now - this.queue[0].at > ATTACK_WARNING_S + ATTACK_ACTIVE_S) {
+    // Versus: a queued attack that couldn't be placed (no pose) for ATTACK_QUEUE_DROP_S is dropped: no damage.
+    if (!this.attack && this.queue.length && now - this.queue[0].at > ATTACK_QUEUE_DROP_S) {
       const q = this.queue.shift();
-      this.stats.hit += 1;
-      this.lastEvent = { outcome: "Hit", pos: [W / 2, H / 2], kind: q.kind, meta: q.meta };
-      this.nextQueuedAt = now + ATTACK_MIN_GAP_S;
-      return "Hit";
+      this.lastEvent = { outcome: "Dodge", pos: [W / 2, H / 2], kind: q.kind, meta: q.meta, dropped: true };
+      return "Dodge";
     }
     const a = this.attack;
     if (!a) return null;
+    // Versus attacks follow the defender's head during the warning phase and freeze when they turn active.
+    if (a.external && lms && a.phase(now) === "warning") {
+      const fresh = spawnAttack(lms, a.spawnTs, a.kind);
+      Object.assign(a, { circle: fresh.circle, band: fresh.band, anchor: fresh.anchor });
+    }
     let outcome = a.phase(now) === "active" && lms ? checkCollision(lms, a, now) : null;
     if (!outcome && now >= a.activeEnd) outcome = "Dodge";
     if (outcome) {
@@ -419,6 +426,7 @@ function drawVignette(strength) {
 let mode = "loading", modeStart = 0, lastVideoTime = -1;
 let st;   // per-round state, see newRound()
 const worldBuf = [];   // {t, skel} normalized world skeletons
+const visBuf = [];     // {t, L, R}: min visibility of shoulder/elbow/wrist per side (versus punch gating)
 // Runs on every camera frame (also before the round) so the guard and scale are learned by the time play starts.
 const detector = new PunchDetector({
   L: { wrist: LW, shoulder: LS, contact: HAND_CONTACT.L },
@@ -623,25 +631,35 @@ async function runModel(clip) {
 }
 async function punchKind(ev) {
   const clip = segmentClip(ev.startT, ev.endT);
-  if (!clip || !session) return ["jab", 0];
+  if (!clip || !session) return null;
   try {
     const plain = await runModel(clip), mirrored = await runModel(mirrorSkeleton(clip));
-    let best = ["jab", 0];
+    let best = [null, 0];
     CLASS_NAMES.forEach((name, i) => {
       const kind = MODEL_TO_TARGET[name];
       if (!kind) return;
       const conf = choosePunchSide(kind, false) === ev.side ? plain[i] : mirrored[i];
       if (conf > best[1]) best = [kind, conf];
     });
-    return best;
-  } catch (e) { console.error("classify failed", e); return ["jab", 0]; }
+    return best[0] && best[1] >= MODEL_CONF_THRESHOLD ? best : null;
+  } catch (e) { console.error("classify failed", e); return null; }
+}
+
+// Shoulder, elbow and wrist of that side were all clearly tracked for the whole punch segment.
+function armVisible(side, startT, endT) {
+  const frames = visBuf.filter((f) => f.t >= startT && f.t <= endT);
+  return frames.length > 0 && frames.every((f) => f[side] >= VS_MIN_VIS);
 }
 
 function stepVersus(lms, now, events) {
   for (const ev of events) {
     if (ev.type !== "punch" || ev.peakT - V.vs.lastPunchT < V.VS_PUNCH_GAP_S) continue;
+    const tr = detector.trackers[ev.side];
+    if (!(tr.maxExt >= VS_MIN_EXT && tr.maxSpeed >= VS_MIN_SPEED) || !armVisible(ev.side, ev.startT, ev.endT)) continue;
     const round = st;
-    punchKind(ev).then(([kind, conf]) => {
+    punchKind(ev).then((res) => {
+      if (!res) return;
+      const [kind, conf] = res;
       if (V.sendPunch(kind, ev.side, conf, ev.peakT) && round === st)
         st.texts.push({ text: `${LABELS[kind]}!`, pos: [W / 2, H * 0.8], color: PUNCH_COLORS[kind], born: performance.now() / 1000, scale: 1.3 });
     });
@@ -650,6 +668,7 @@ function stepVersus(lms, now, events) {
   if (!outcome) return;
   const meta = defense.lastEvent.meta;
   if (meta) V.sendOutcome(meta.attackId, outcome);
+  if (defense.lastEvent.dropped) return;
   if (outcome === "Hit") {
     st.vignetteUntil = now + HIT_VIGNETTE_S;
     st.texts.push({ text: "HIT!", pos: defense.lastEvent.pos, color: [255, 60, 60], born: now, scale: 1.2 });
@@ -727,6 +746,9 @@ function loop() {
     worldBuf.push({ t: now, skel: normalizeSkeleton(res.worldLandmarks[0]) });
     if (worldBuf.length > WORLD_BUFFER_FRAMES) worldBuf.shift();
   }
+  const vis = (i) => lms?.[i]?.visibility ?? 0;
+  visBuf.push({ t: now, L: Math.min(vis(LS), vis(LE), vis(LW)), R: Math.min(vis(RS), vis(RE), vis(RW)) });
+  if (visBuf.length > WORLD_BUFFER_FRAMES) visBuf.shift();
   const punchEvents = lms ? detector.update(now, lms) : [];
 
   // Shapes are drawn in camera coordinates under a mirror transform; text after, at mirrored x.
