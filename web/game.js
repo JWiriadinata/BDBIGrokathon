@@ -3,6 +3,7 @@
 import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs";
 import { CLASS_NAMES, CLIP_FRAMES, TARGET_FPS, normalizeSkeleton, extractLiveClip, mirrorSkeleton, buildTensor } from "./pipeline.js";
+import { PunchDetector, GUARD_READY_SAMPLES } from "./punchDetector.js";
 
 // ── Game config (same values as main_python_analysis.py) ─────────────────────
 const STANCE = "orthodox";
@@ -18,7 +19,13 @@ const SCORE_PERFECT = 300, SCORE_GOOD = 100, SCORE_DEFENSE_BONUS = 50, SCORE_HIT
 const FLOATING_TEXT_S = 0.6, HIT_VIGNETTE_S = 0.3, SCHEDULE_MARGIN_S = 0.1;
 const MODEL_CONF_THRESHOLD = 0.55, LOOK_BACK_SECONDS = 2.5, WORLD_BUFFER_FRAMES = 150;
 const MAX_RUNTIME = 30, PRESTART_COUNTDOWN_S = 3, PREDICTION_OVERLAY_S = 1.8, TARGET_RESPAWN_DELAY_S = 2.0;
-const MODEL_TO_TARGET = { jab: "jab", "lead-hook": "hook", "rear-uppercut": "uppercut" };
+// Punch detection (punchDetector.js). A detected punch is only listened to for the hand of the active target.
+const SEGMENT_BUFFER_FRAMES = 3;     // camera frames added either side of a punch's start→end for the model
+const PUNCH_RESOLVE_GRACE_S = 0.35;  // after the hit window closes, wait this long for a punch still being thrown
+const PENDING_CLASSIFY_S = 0.6;      // after a wrist-overlap hit, wait this long for the punch segment to finish
+const SHOW_PUNCH_DEBUG = true;       // per-hand detector state + peak circles (like both_hands_tracking.py)
+const PEAK_DISPLAY_S = 0.5;
+const MODEL_TO_TARGET ={ jab: "jab", "lead-hook": "hook", "rear-uppercut": "uppercut" };
 // Pixel sizes below were tuned for the Python app's 960×540 camera; scaled by W / 960.
 const BASE_W = 960, TARGET_RADIUS_PX = 25;
 
@@ -40,6 +47,7 @@ const LABELS = { jab: "JAB", hook: "HOOK", uppercut: "UPPERCUT", L: "LEFT", R: "
 // MediaPipe Pose landmark indices.
 const NOSE = 0, LS = 11, RS = 12, LE = 13, RE = 14, LW = 15, RW = 16, LHIP = 23, RHIP = 24;
 const HAND_CONTACT = { L: [15, 19, 21, 17], R: [16, 20, 22, 18] };   // wrist, index, thumb, pinky
+const SIDE_COLORS = { L: [0, 255, 0], R: [255, 165, 0] };             // debug overlay only
 
 const POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task";
 const MP_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
@@ -111,14 +119,15 @@ function respawnTarget(lms, radius, side, margin, avoidHandsPx) {
   return best;
 }
 
-function handHitsCircle(lms, [cx, cy], radius, side) {
+function pointsHitCircle(points, [cx, cy], radius) {
   const r = Math.max(1, Math.trunc(radius * HIT_RADIUS_SCALE));
-  return HAND_CONTACT[side].some((i) => {
-    if ((lms[i].visibility ?? 1) < 0.35) return false;
-    const [x, y] = toPx(lms[i]);
+  return points.some((p) => {
+    if ((p.visibility ?? 1) < 0.35) return false;
+    const [x, y] = toPx(p);
     return (x - cx) ** 2 + (y - cy) ** 2 <= r * r;
   });
 }
+const handHitsCircle = (lms, center, radius, side) => pointsHitCircle(HAND_CONTACT[side].map((i) => lms[i]), center, radius);
 
 // ── Defense: attacks (defense.py) ────────────────────────────────────────────
 function posePoints(lms) {
@@ -380,13 +389,18 @@ function drawVignette(strength) {
 let mode = "loading", modeStart = 0, lastVideoTime = -1;
 let st;   // per-round state, see newRound()
 const worldBuf = [];   // {t, skel} normalized world skeletons
+// Runs on every camera frame (also before the round) so the guard and scale are learned by the time play starts.
+const detector = new PunchDetector({
+  L: { wrist: LW, shoulder: LS, contact: HAND_CONTACT.L },
+  R: { wrist: RW, shoulder: RS, contact: HAND_CONTACT.R },
+});
 
 function newRound(now) {
   defense.reset();
   st = {
     start: now, score: 0, phase: "idle", type: null, side: null, center: null, spawnTs: 0, idealTs: 0,
     calloutTs: 0, nextSpawn: 0, handInsidePrev: true, recent: [], reserved: [], texts: [], vignetteUntil: 0,
-    prediction: null, timing: { perfect: 0, good: 0, miss: 0 },
+    prediction: null, pending: null, timing: { perfect: 0, good: 0, miss: 0 },
   };
 }
 
@@ -407,15 +421,49 @@ function bufferFps() {
   return n > 1 ? (n - 1) / (worldBuf[n - 1].t - worldBuf[0].t) : 30;
 }
 
-async function classify(type, side, spawnTs) {
+// Fallback when no punch segment was detected: frames since the target appeared, or a fixed look-back.
+function snapshotClip(spawnTs) {
   const fps = bufferFps();
-  // Frames since the target appeared (one punch per clip); fall back to a fixed look-back.
   let frames = worldBuf.filter((f) => f.t >= spawnTs);
   const minRaw = Math.max(2, Math.round(LOOK_BACK_SECONDS * fps));
   if (frames.length < minRaw) frames = worldBuf.slice(-minRaw);
-  let clip = extractLiveClip(frames.map((f) => f.skel), fps);
+  return extractLiveClip(frames.map((f) => f.skel), fps);
+}
+
+// A detected punch: the velocity peak is searched only in its start→end frames ± SEGMENT_BUFFER_FRAMES.
+// The model still needs CLIP_FRAMES frames ending at that peak, so earlier frames are prepended as lead-in:
+// extractLiveClip only searches after its first CLIP_FRAMES (resampled) frames, i.e. from about `lo` onward.
+function segmentClip(startT, endT) {
+  const fps = bufferFps();
+  const first = worldBuf.findIndex((f) => f.t >= startT);
+  const last = worldBuf.findLastIndex((f) => f.t <= endT);
+  if (first < 0 || last < first) return null;
+  const lo = Math.max(0, first - SEGMENT_BUFFER_FRAMES), hi = Math.min(worldBuf.length - 1, last + SEGMENT_BUFFER_FRAMES);
+  const from = Math.max(0, lo - Math.ceil((CLIP_FRAMES - 1) / TARGET_FPS * fps));
+  return extractLiveClip(worldBuf.slice(from, hi + 1).map((f) => f.skel), fps);
+}
+
+// The clip is built synchronously (worldBuf keeps changing); only the model run is async.
+function requestPrediction(round, type, side, clip) {
+  classify(type, side, clip)
+    .then((p) => { round.prediction = { ...p, until: performance.now() / 1000 + PREDICTION_OVERLAY_S }; })
+    .catch((e) => console.error("classify failed", e));
+}
+
+const isPunchFor = (e, side, sinceTs) => e.type === "punch" && e.side === side && e.peakT >= sinceTs;
+
+// After a wrist-overlap hit, classify the called hand's punch once the detector reports it finished.
+function resolvePending(now, events) {
+  const p = st.pending, ev = events.find((e) => isPunchFor(e, p.side, p.spawnTs));
+  if (ev) requestPrediction(st, p.type, p.side, segmentClip(ev.startT, ev.endT) ?? snapshotClip(p.spawnTs));
+  else if (now > p.deadline) requestPrediction(st, p.type, p.side, snapshotClip(p.spawnTs));
+  else return;
+  st.pending = null;
+}
+
+async function classify(type, side, clip) {
   if (!clip) {
-    const needed = Math.max(2, Math.round(CLIP_FRAMES / TARGET_FPS * fps));
+    const needed = Math.max(2, Math.round(CLIP_FRAMES / TARGET_FPS * bufferFps()));
     return { text: `Warming up (${worldBuf.length}/${needed} frames)`, color: [220, 220, 220] };
   }
   // The model only learned the stance-default hand per punch type; mirror the other hand.
@@ -430,7 +478,7 @@ async function classify(type, side, spawnTs) {
            color: confident ? [0, 255, 0] : [255, 165, 0] };
 }
 
-function stepRound(lms, now) {
+function stepRound(lms, now, events) {
   st.reserved = st.reserved.filter((w) => w[1] > now);
   const radius = TARGET_RADIUS_PX * S, visualR = radius * TARGET_VISUAL_SCALE;
 
@@ -455,29 +503,39 @@ function stepRound(lms, now) {
     }
   }
 
-  // 3. Hit = the called hand ENTERING the target inside the timing window; a resting guard doesn't count.
+  // 3. Hit = either signal, inside the timing window:
+  //    - overlap: the called hand ENTERING the target (a resting guard doesn't count), graded at that moment;
+  //    - punch: a detected punch from the called hand peaking on the target, graded at the peak time.
+  //    Any other detected punch from the called hand while the target is up is a miss. Punches from the other
+  //    hand, and punches when no target is active, are ignored.
+  if (st.pending) resolvePending(now, events);
   if (st.phase === "active") {
     const windowOpen = now >= st.idealTs - GOOD_WINDOW_S, windowClose = st.idealTs + GOOD_WINDOW_S;
-    let hit = false;
+    const punch = events.find((e) => isPunchFor(e, st.side, st.spawnTs));
+    let overlapHit = false;
     if (lms) {
       const inside = handHitsCircle(lms, st.center, radius, st.side);
-      hit = windowOpen && now <= windowClose && inside && !st.handInsidePrev;
+      overlapHit = windowOpen && now <= windowClose && inside && !st.handInsidePrev;
       st.handInsidePrev = inside;
     }
+    const punchHit = !!punch && Math.abs(punch.peakT - st.idealTs) <= GOOD_WINDOW_S && pointsHitCircle(punch.peakPts, st.center, radius);
+    const hit = overlapHit || punchHit;
+    // A punch still being thrown when the window closes gets a moment to report its (possibly in-window) peak.
+    const settling = now <= windowClose + PUNCH_RESOLVE_GRACE_S && detector.trackers[st.side].state === "throwing";
+    const missed = !hit && (!!punch || (now > windowClose && !settling));
     if (hit) {
-      const grade = Math.abs(now - st.idealTs) <= PERFECT_WINDOW_S ? "PERFECT" : "GOOD";
+      const gradeTs = punchHit ? punch.peakT : now;
+      const grade = Math.abs(gradeTs - st.idealTs) <= PERFECT_WINDOW_S ? "PERFECT" : "GOOD";
       st.timing[grade.toLowerCase()] += 1;
       st.score += grade === "PERFECT" ? SCORE_PERFECT : SCORE_GOOD;
       st.texts.push({ text: grade, pos: st.center, color: GRADE_COLORS[grade], born: now, scale: grade === "PERFECT" ? 1.4 : 1.2 });
-      const round = st;
-      classify(st.type, st.side, st.spawnTs)
-        .then((p) => { round.prediction = { ...p, until: performance.now() / 1000 + PREDICTION_OVERLAY_S }; })
-        .catch((e) => console.error("classify failed", e));
-    } else if (now > windowClose) {
+      if (punch) requestPrediction(st, st.type, st.side, segmentClip(punch.startT, punch.endT) ?? snapshotClip(st.spawnTs));
+      else st.pending = { type: st.type, side: st.side, spawnTs: st.spawnTs, deadline: now + PENDING_CLASSIFY_S };
+    } else if (missed) {
       st.timing.miss += 1;
       st.texts.push({ text: "MISS", pos: st.center, color: GRADE_COLORS.MISS, born: now, scale: 1.1 });
     }
-    if (hit || now > windowClose) {
+    if (hit || missed) {
       Object.assign(st, { phase: "idle", center: null, type: null, side: null, nextSpawn: now + TARGET_RESPAWN_DELAY_S });
     }
   }
@@ -522,6 +580,29 @@ function drawRoundText(now) {
   drawHud(st.score, MAX_RUNTIME - (now - st.start));
 }
 
+// Debug overlay for the punch detector: peak circles in camera coords (call under the mirror transform)…
+function drawPunchPeaks(now) {
+  for (const [side, tr] of Object.entries(detector.trackers)) {
+    tr.punchPeaks = tr.punchPeaks.filter((p) => now - p.t < PEAK_DISPLAY_S);
+    for (const p of tr.punchPeaks) { const [x, y] = toPx(p.pos); strokeCircle(x, y, 30 * S, rgba(SIDE_COLORS[side]), 3); }
+  }
+}
+
+// …and per-hand state text in screen coords.
+function drawPunchState() {
+  ctx.save();
+  ctx.font = `bold ${18 * S}px system-ui, sans-serif`;
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  Object.entries(detector.trackers).forEach(([side, tr], i) => {
+    const state = tr.guardReady ? tr.state : `learning guard ${tr.guardBuf.length}/${GUARD_READY_SAMPLES}`;
+    const text = `${side}: ${state}  ext ${tr.lastExt.toFixed(2)}  spd ${tr.lastSpeed.toFixed(1)}`;
+    ctx.fillStyle = rgba(SIDE_COLORS[side]);
+    ctx.fillText(text, 20 * S, H * 0.2 + 28 * S * i);
+  });
+  ctx.restore();
+}
+
 function showPanel(html, buttonText) {
   statusEl.innerHTML = html;
   startBtn.textContent = buttonText;
@@ -552,6 +633,7 @@ function loop() {
     worldBuf.push({ t: now, skel: normalizeSkeleton(res.worldLandmarks[0]) });
     if (worldBuf.length > WORLD_BUFFER_FRAMES) worldBuf.shift();
   }
+  const punchEvents = lms ? detector.update(now, lms) : [];
 
   // Shapes are drawn in camera coordinates under a mirror transform; text after, at mirrored x.
   ctx.setTransform(-1, 0, 0, 1, W, 0);
@@ -563,8 +645,10 @@ function loop() {
                            { color: "#f5f5f5", lineWidth: 2 });
     drawing.drawLandmarks(lms.filter(shown), { color: "#ff3030", radius: 3 });
   }
-  if (mode === "playing") stepRound(lms, now);
+  if (SHOW_PUNCH_DEBUG) drawPunchPeaks(now);
+  if (mode === "playing") stepRound(lms, now, punchEvents);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (SHOW_PUNCH_DEBUG) drawPunchState();
 
   if (mode === "countdown") {
     const left = PRESTART_COUNTDOWN_S - (now - modeStart);
