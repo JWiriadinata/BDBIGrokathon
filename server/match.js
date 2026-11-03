@@ -99,8 +99,7 @@ export class Lobby {
   rematch(player) {
     const room = player.room;
     if (!room || (room.match && !room.match.over)) return;
-    room.match = null;
-    room.ready.clear();
+    if (room.match?.over) { room.match = null; room.ready.clear(); }
     this.ready(player);
   }
 

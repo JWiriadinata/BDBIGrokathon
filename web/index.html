@@ -15,6 +15,10 @@
     #panel h2 { margin-top: 0; }
     #start { font: inherit; font-weight: 700; padding: 0.7rem 1.6rem; border: 0; border-radius: 8px;
              background: #ffe600; color: #111; cursor: pointer; }
+    .btn { font: inherit; font-weight: 700; padding: 0.5rem 1.2rem; border: 0; border-radius: 8px; background: #3ad45a; color: #111; cursor: pointer; }
+    #lobby input { font: inherit; padding: 0.45rem; border-radius: 6px; border: 1px solid #555; background: #222; color: #eee; text-transform: none; }
+    #vsCode { text-transform: uppercase; letter-spacing: .15em; }
+    [hidden] { display: none !important; }
   </style>
 </head>
 <body>
@@ -24,6 +28,13 @@
     <div id="panel" role="dialog" aria-live="polite">
       <div id="status">Loading…</div>
       <button id="start" hidden></button>
+      <div id="lobby" hidden>
+        <hr>
+        <p><input id="vsName" placeholder="Your name" maxlength="24"></p>
+        <p><button id="vsCreate" class="btn">Create room</button></p>
+        <p id="vsJoinRow"><input id="vsCode" placeholder="CODE" maxlength="6" size="7"> <button id="vsJoin" class="btn">Join</button></p>
+        <p><button id="vsReady" class="btn" hidden>Ready</button> <button id="vsRematch" class="btn" hidden>Rematch</button></p>
+      </div>
     </div>
   </main>
   <script type="module" src="game.js"></script>

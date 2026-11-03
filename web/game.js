@@ -4,6 +4,7 @@ import { FilesetResolver, PoseLandmarker, DrawingUtils } from "https://cdn.jsdel
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.mjs";
 import { CLASS_NAMES, CLIP_FRAMES, TARGET_FPS, normalizeSkeleton, extractLiveClip, mirrorSkeleton, buildTensor } from "./pipeline.js";
 import { PunchDetector, GUARD_READY_SAMPLES } from "./punchDetector.js";
+import * as V from "./versus.js";
 
 // ── Game config (same values as main_python_analysis.py) ─────────────────────
 const STANCE = "orthodox";
@@ -62,6 +63,7 @@ const statusEl = document.getElementById("status");
 const startBtn = document.getElementById("start");
 let W = 960, H = 540, S = 1;
 let landmarker, session, drawing;
+let versus = false;   // true while in a 1v1 match (no prompted targets, no random self-attacks)
 
 // ── Small helpers ────────────────────────────────────────────────────────────
 const rgba = (c, a = 1, k = 1) => `rgba(${c[0] * k | 0},${c[1] * k | 0},${c[2] * k | 0},${a})`;
@@ -597,7 +599,57 @@ function drawRoundText(now) {
     ctx.strokeRect(W / 2 - tw / 2 - pad, y - th / 2 - pad, tw + 2 * pad, th + 2 * pad);
     textCentered(st.prediction.text, W / 2, y, st.prediction.color, 1, false);
   }
-  drawHud(st.score, MAX_RUNTIME - (now - st.start));
+  if (versus) drawVersusHud(); else drawHud(st.score, MAX_RUNTIME - (now - st.start));
+}
+
+// ── Versus mode ──────────────────────────────────────────────────────────────
+// Own punches become attacks on the opponent; the opponent's arrive through defense.enqueue().
+async function punchKind(ev) {
+  const clip = segmentClip(ev.startT, ev.endT);
+  if (!clip || !session) return ["jab", 0];
+  try {
+    const out = await session.run({ input: new ort.Tensor("float32", buildTensor(clip), [1, 7, CLIP_FRAMES, 4, 3]) });
+    const logits = Array.from(out.logits.data), best = logits.indexOf(Math.max(...logits));
+    const m = Math.max(...logits), sum = logits.reduce((a, l) => a + Math.exp(l - m), 0);
+    return [MODEL_TO_TARGET[CLASS_NAMES[best]] ?? "jab", 1 / sum];
+  } catch (e) { console.error("classify failed", e); return ["jab", 0]; }
+}
+
+function stepVersus(lms, now, events) {
+  for (const ev of events) {
+    if (ev.type !== "punch" || ev.peakT - V.vs.lastPunchT < V.VS_PUNCH_GAP_S) continue;
+    const round = st;
+    punchKind(ev).then(([kind, conf]) => {
+      if (V.sendPunch(kind, ev.side, conf, ev.peakT) && round === st)
+        st.texts.push({ text: `${LABELS[kind]}!`, pos: [W / 2, H * 0.8], color: PUNCH_COLORS[kind], born: performance.now() / 1000, scale: 1.3 });
+    });
+  }
+  const outcome = defense.update(lms, now, []);
+  if (!outcome) return;
+  const meta = defense.lastEvent.meta;
+  if (meta) V.sendOutcome(meta.attackId, outcome);
+  if (outcome === "Hit") {
+    st.vignetteUntil = now + HIT_VIGNETTE_S;
+    st.texts.push({ text: "HIT!", pos: defense.lastEvent.pos, color: [255, 60, 60], born: now, scale: 1.2 });
+  } else st.texts.push({ text: outcome === "Dodge" ? "DODGED!" : "BLOCKED!", pos: defense.lastEvent.pos, color: WHITE, born: now, scale: 1.2 });
+}
+
+function drawHealthBar(x1, y1, x2, y2, frac, name, alignRight) {
+  pill(x1 - 6, y1 - 6, x2 + 6, y2 + 6);
+  const w = (x2 - x1) * Math.max(0, Math.min(1, frac));
+  fillRect(alignRight ? [x2 - w, y1, x2, y2] : [x1, y1, x1 + w, y2], frac > 0.3 ? "rgba(60,220,90,0.95)" : "rgba(255,70,70,0.95)");
+  ctx.font = `bold ${Math.max(14, (y2 - y1) * 0.7)}px system-ui, sans-serif`;
+  textCentered(name, (x1 + x2) / 2, (y1 + y2) / 2, WHITE, 1, true);
+}
+
+function drawVersusHud() {
+  const { me, opp, health } = V.vs, margin = Math.max(12, W / 60), barH = Math.max(22, H / 22), barW = W * 0.36;
+  drawHealthBar(margin, margin, margin + barW, margin + barH, (health[me] ?? 100) / 100, `YOU ${health[me] ?? 100}`, false);
+  drawHealthBar(W - margin - barW, margin, W - margin, margin + barH, (health[opp?.id] ?? 100) / 100,
+                `${(opp?.name ?? "OPPONENT").toUpperCase()} ${health[opp?.id] ?? 100}`, true);
+  const s = Math.ceil(V.remainingS());
+  fitFont("0:00", W * 0.1, barH);
+  textCentered(`${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`, W / 2, margin + barH / 2, s <= 5 ? [255, 80, 80] : WHITE);
 }
 
 // Debug overlay for the punch detector: peak circles in camera coords (call under the mirror transform)…
@@ -666,22 +718,58 @@ function loop() {
     drawing.drawLandmarks(lms.filter(shown), { color: "#ff3030", radius: 3 });
   }
   if (SHOW_PUNCH_DEBUG) drawPunchPeaks(now);
-  if (mode === "playing") stepRound(lms, now, punchEvents);
+  if (mode === "playing") (versus ? stepVersus : stepRound)(lms, now, punchEvents);
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (SHOW_PUNCH_DEBUG) drawPunchState();
 
   if (mode === "countdown") {
-    const left = PRESTART_COUNTDOWN_S - (now - modeStart);
-    if (left <= 0) { mode = "playing"; newRound(now); }
+    const left = versus ? V.countdownLeftS() : PRESTART_COUNTDOWN_S - (now - modeStart);
+    if (left <= 0) { mode = "playing"; newRound(now); if (versus) defense.reset({ autoSpawn: false }); }
     else { fitFont("3", W * 0.3, H * 0.3); textCentered(String(Math.ceil(left)), W / 2, H / 2, WHITE); }
   }
   if (mode === "playing") {
     drawRoundText(now);
-    if (now - st.start >= MAX_RUNTIME) endRound();
+    if (!versus && now - st.start >= MAX_RUNTIME) endRound();
   }
 }
 
+// ── Lobby (versus) ───────────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const lobbyEl = $("lobby");
+function showLobby(html) {
+  versus = false;
+  if (mode !== "over") mode = "ready";
+  defense.reset();
+  showPanel(html, "Solo round");
+  lobbyEl.hidden = false;
+  $("vsJoinRow").hidden = $("vsCreate").hidden = false;
+  $("vsReady").hidden = $("vsRematch").hidden = true;
+}
+const vsCallbacks = {
+  status: (html) => { statusEl.innerHTML = html; startBtn.hidden = true; $("vsJoinRow").hidden = $("vsCreate").hidden = true; panel.hidden = false; },
+  onMatchStart: () => { versus = true; panel.hidden = true; mode = "countdown"; },
+  onAttack: (kind, attackId) => { if (versus && mode === "playing") defense.enqueue(kind, { attackId }); },
+  onEnd: (text) => {
+    mode = "ready"; defense.reset();
+    statusEl.innerHTML = `<h2>${text}</h2>`;
+    startBtn.hidden = true; $("vsReady").hidden = true; $("vsRematch").hidden = false; panel.hidden = false;
+  },
+  onLeft: (text) => { V.disconnect(); showLobby(`<h2>${text}</h2><p>Back to the lobby.</p>`); },
+};
+async function vsAction(fn) {
+  try { await V.connect(vsCallbacks); fn(V.vs.net); }
+  catch (e) { statusEl.innerHTML = `<p>${e.message}. Start the server with <code>npm start</code>.</p>`; }
+}
+const playerName = () => $("vsName").value.trim() || "Player";
+$("vsCreate").addEventListener("click", () => vsAction((net) => net.send("create_room", { name: playerName() })));
+$("vsJoin").addEventListener("click", () => vsAction((net) => net.send("join_room", { code: $("vsCode").value.trim().toUpperCase(), name: playerName() })));
+$("vsReady").addEventListener("click", () => { V.vs.net?.send("ready"); statusEl.innerHTML += "<p>Waiting for opponent to be ready…</p>"; $("vsReady").hidden = true; });
+$("vsRematch").addEventListener("click", () => { V.vs.net?.send("rematch"); statusEl.innerHTML = "<p>Rematch requested… waiting for opponent.</p>"; $("vsRematch").hidden = true; });
+
 startBtn.addEventListener("click", () => {
+  V.disconnect();
+  versus = false;
+  lobbyEl.hidden = true;
   panel.hidden = true;
   mode = "countdown";
   modeStart = performance.now() / 1000;
@@ -711,7 +799,9 @@ async function init() {
     ]);
     mode = "ready";
     showPanel(`<h2>Perfect Punch</h2><p>Stand back so your head, shoulders and hips are in view.</p>
-      <p>Hit targets with the called hand as the ring closes. Dodge or block the orange attacks.</p>`, "Start round");
+      <p>Hit targets with the called hand as the ring closes. Dodge or block the orange attacks.</p>
+      <p>Or fight a friend: create a room and share the code.</p>`, "Solo round");
+    lobbyEl.hidden = false;
     loop();
   } catch (e) {
     console.error(e);
