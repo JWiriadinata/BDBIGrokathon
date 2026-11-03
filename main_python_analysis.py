@@ -66,6 +66,8 @@ except ImportError:
 
 # Show OpenCV window by default; set SHOW_DISPLAY=false to force headless mode.
 SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'true').strip().lower() in {'1', 'true', 'yes', 'on'}
+# Normal resizable window by default; set FULLSCREEN=true for borderless fullscreen (Windows).
+FULLSCREEN = os.getenv('FULLSCREEN', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
 
 # ════════════════════════════════════════════════════════════════════════════
 # GAME / UI CONFIG — all the tunables for the callout → target → attack flow.
@@ -73,7 +75,7 @@ SHOW_DISPLAY = os.getenv('SHOW_DISPLAY', 'true').strip().lower() in {'1', 'true'
 # live at the top of defense.py.
 # ════════════════════════════════════════════════════════════════════════════
 STANCE              = "orthodox"   # "orthodox" (lead = left) or "southpaw" (lead = right)
-ALLOW_RANDOM_SIDES  = False        # True = random L/R for every punch (needs a model trained on both hands)
+ALLOW_RANDOM_SIDES  = True         # True = random L/R for every punch (off-hand clips are mirrored for the model)
 
 CALLOUT_DURATION_S  = 0.4          # "LEFT JAB" banner time before the target appears
 APPROACH_DURATION_S = 1.0          # approach ring shrink time; ring touches the edge = ideal hit
@@ -128,6 +130,13 @@ L_ELBOW,    R_ELBOW    = 13, 14
 L_WRIST,    R_WRIST    = 15, 16
 TRACK    = [L_ELBOW, R_ELBOW, L_WRIST, R_WRIST]
 SHOULDER = [L_SHOULDER, R_SHOULDER, L_SHOULDER, R_SHOULDER]
+
+# Left/right landmark pairs (MediaPipe Pose), used to mirror a skeleton.
+_LR_PAIRS = [(1, 4), (2, 5), (3, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16),
+             (17, 18), (19, 20), (21, 22), (23, 24), (25, 26), (27, 28), (29, 30), (31, 32)]
+MIRROR_INDEX = list(range(33))
+for _l, _r in _LR_PAIRS:
+    MIRROR_INDEX[_l], MIRROR_INDEX[_r] = _r, _l
 
 mp_drawing = mp.solutions.drawing_utils
 mp_pose    = mp.solutions.pose
@@ -221,6 +230,14 @@ def normalize_skeleton(lm_list):
     if dist > 1e-6:
         coords[:, :3] /= dist
     return coords
+
+
+def mirror_skeleton(clip):
+    """Left/right mirror of a (T, 33, 4) hip-centred clip: swap paired joints, negate x.
+    Lets the model (trained on one hand per punch type) classify the other hand."""
+    out = clip[:, MIRROR_INDEX].copy()
+    out[:, :, 0] *= -1
+    return out
 
 
 def compound_velocity(curr, prev):
@@ -682,7 +699,7 @@ if SHOW_DISPLAY:
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.waitKey(1)
 
-if SHOW_DISPLAY and sys.platform == "win32":
+if SHOW_DISPLAY and FULLSCREEN and sys.platform == "win32":
     GWL_STYLE    = -16
     WS_CAPTION      = 0x00C00000
     WS_THICKFRAME   = 0x00040000
@@ -1011,6 +1028,11 @@ while cap.isOpened():
 
         # Extract the model clip (resample, smooth, pick peak velocity)
         clip = extract_live_clip(punch_frames, actual_fps)
+
+        # The model only learned the stance-default hand for each punch type;
+        # mirror off-hand punches so they look like the hand it knows.
+        if clip is not None and CURRENT_SIDE != choose_punch_side(CURRENT_TYPE, STANCE, False):
+            clip = mirror_skeleton(clip)
 
         if clip is not None:
             # Build model input tensor and run the CNN to get class probabilities
