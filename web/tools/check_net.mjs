@@ -1,9 +1,10 @@
 // Node checks for versus networking and damage. No dependencies.
 // Run: node web/tools/check_net.mjs
-import { Net, TURN_SERVERS, buildIceConfig, clockSample, noteClockSample, encodePose, decodePose, POSE_INDICES, clampMult } from "../net.js";
+import { Net, TURN_SERVERS, buildIceConfig, clockSample, noteClockSample, encodePose, decodePose, POSE_INDICES } from "../net.js";
 import {
-  sampleOpponent, hitDamage, blockDamage, applyHp, enqueueAttack, judge,
-  BotOpponent, botSkeleton, OPP_HOLD_S, DAMAGE, MAX_HP,
+  sampleOpponent, hitDamage, blockDamage, applyHp, enqueueAttack, judge, acceptPunch,
+  mapCamPoint, mapCamRadius, pipRect, PUNCH_ATTACK_COOLDOWN_S, ATTACK_DAMAGE,
+  BotOpponent, botSkeleton, OPP_HOLD_S, MAX_HP,
 } from "../versus.js";
 
 let failed = 0;
@@ -91,18 +92,29 @@ section("3. interpolation");
   assert(sampleOpponent([], 1).k === null, "empty buffer yields nothing");
 }
 
-section("4. damage");
+section("4. damage, cooldown, circle mapping");
 {
-  assert(hitDamage("jab", 1.5) === 12, "PERFECT jab = 12");
-  assert(hitDamage("jab", 1) === 8, "GOOD jab = 8");
-  assert(hitDamage("hook", 1.5) === 18, "PERFECT hook = 18");
-  const blocked = blockDamage("uppercut", 1.5);
-  assert(blocked === Math.round(22.5 * 0.5), `Block on a PERFECT uppercut = round(22.5*0.5) (${blocked})`);
-  assert(applyHp(5, 10) === 0 && applyHp(0, 4) === 0 && applyHp(100, 12) === 88, "HP never goes below 0");
+  assert(hitDamage() === ATTACK_DAMAGE && hitDamage() === 10, "a clean hit is 10");
+  assert(blockDamage() === Math.round(ATTACK_DAMAGE * 0.5) && blockDamage() === 5, "a block is half damage (5)");
+  assert(applyHp(5, 10) === 0 && applyHp(0, 4) === 0 && applyHp(100, 10) === 90, "HP never goes below 0");
   assert(judge(10, 10, 300, 100) === "win" && judge(10, 10, 50, 50) === "draw" && judge(0, 1, 999, 0) === "lose", "winner is HP, then score, then draw");
   const q = [{ id: 1 }, { id: 2 }];
   assert(enqueueAttack(q, { id: 3 }) === false && q.length === 2, "a full attack queue drops the new one");
   assert(enqueueAttack([{ id: 1 }], { id: 2 }) === true, "a short queue accepts");
+  const first = acceptPunch(0, 5);
+  assert(first.ok && Math.abs(first.nextAt - (5 + PUNCH_ATTACK_COOLDOWN_S)) < 1e-9, "a punch starts the cooldown");
+  assert(acceptPunch(first.nextAt, 5.3).ok === false, "a second swing inside 0.6 s is ignored");
+  assert(acceptPunch(first.nextAt, first.nextAt).ok === true, "a punch after the cooldown is sent");
+  const W = 960, H = 540, cam = [120, 200];
+  const full = { x: 0, y: 0, w: W, h: H };
+  const pip = pipRect(W, H);
+  const main = mapCamPoint(cam[0], cam[1], W, H, full);
+  const thumb = mapCamPoint(cam[0], cam[1], W, H, pip);
+  assert(Math.abs(main[0] - (W - cam[0])) < 1e-6 && Math.abs(main[1] - cam[1]) < 1e-6, "the main circle is the mirrored head");
+  const frac = (p, rect) => [(p[0] - rect.x) / rect.w, (p[1] - rect.y) / rect.h];
+  const a = frac(main, full), b = frac(thumb, pip);
+  assert(Math.abs(a[0] - b[0]) < 1e-6 && Math.abs(a[1] - b[1]) < 1e-6, "PiP circle matches the main circle as a fraction of the frame");
+  assert(Math.abs(mapCamRadius(80, W, pip) - 80 * pip.w / W) < 1e-6, "circle radius scales with the frame");
 }
 
 section("5 + 6. fake peer exchange and the message handler");
@@ -214,7 +226,7 @@ section("5 + 6. fake peer exchange and the message handler");
   await flush();
   host.sendEvent("start", { t0: 123.5 });
   await flush();
-  guest.sendEvent("attack", { id: 1, kind: "jab", mult: 1.5, sentAt: 10 });
+  guest.sendEvent("attack", { id: 1, sentAt: 10 });
   await flush();
   host.sendEvent("attackResult", { id: 1, outcome: "Hit", dmg: 12 });
   await flush();
@@ -234,12 +246,10 @@ section("5 + 6. fake peer exchange and the message handler");
   const before = attacks.length;
   events.emit("data", "{not json");
   events.emit("data", { t: "made-up", v: 1 });
-  events.emit("data", { t: "attack", v: 1, id: 7, kind: "haymaker", mult: 1.5, sentAt: 0 });
-  events.emit("data", { t: "attack", v: 1, id: 8, kind: "jab", mult: 9, sentAt: 0 });
-  events.emit("data", { t: "attack", v: 1, id: 9, kind: "hook", mult: 0, sentAt: 0 });
-  assert(attacks.length === before + 2, "unknown t, bad JSON and invalid kind are ignored");
-  assert(attacks[before].mult === 1.5 && attacks[before].kind === "jab", "mult 9 is clamped to 1.5");
-  assert(attacks[before + 1].mult === clampMult(0) && attacks[before + 1].mult === 0.5, "mult 0 is clamped to 0.5");
+  events.emit("data", { t: "attack", v: 1, sentAt: 1 });
+  events.emit("data", { t: "attack", v: 1, id: 8, kind: "haymaker", mult: 9, sentAt: 4 });
+  assert(attacks.length === before + 1, "unknown t, bad JSON and an attack with no id are ignored");
+  assert(attacks[before].id === 8 && attacks[before].sentAt === 4 && attacks[before].kind === undefined, "kind and mult are not part of an attack");
 
   const stranger = new Net({ PeerCtor: FakePeer, name: "Eve" });
   let strangerMsg = "";
@@ -274,20 +284,27 @@ section("bot opponent");
     rng: (() => { const v = [0.9, 0.9, 0.2]; let i = 0; return () => v[Math.min(i++, v.length - 1)]; })(),
   });
   bot.addEventListener("pose", (e) => { if (e.detail.k.length === 45) seen.pose += 1; });
-  bot.addEventListener("attack", () => { seen.attack += 1; });
+  bot.addEventListener("attack", (e) => { seen.attack += 1; seen.attackMsg = e.detail; });
   bot.addEventListener("attackResult", (e) => { seen.result = e.detail; });
   bot.addEventListener("state", (e) => { seen.state = e.detail; });
   bot.start();
-  bot.sendEvent("attack", { id: 4, kind: "jab", mult: 1.5, sentAt: 0 });
+  bot.sendEvent("attack", { id: 4, sentAt: 0 });
   await new Promise((r) => setTimeout(r, 30));
-  assert(seen.result?.outcome === "Hit" && seen.result.dmg === 12, `bot answers a PERFECT jab with Hit 12 (${seen.result?.outcome} ${seen.result?.dmg})`);
-  assert(seen.state?.hp === MAX_HP - 12, "bot HP drops by the damage it reports");
+  assert(seen.result?.outcome === "Hit" && seen.result.dmg === 10, `bot answers a punch with Hit 10 (${seen.result?.outcome} ${seen.result?.dmg})`);
+  assert(seen.state?.hp === MAX_HP - 10, "bot HP drops by the fixed damage");
   const sk = botSkeleton(1.2);
   assert(sk.length === 45 && sk.every((n) => Number.isFinite(n)), "synthetic skeleton is 45 finite numbers");
   bot.setLive(true);
   await new Promise((r) => setTimeout(r, 80));
   assert(seen.pose > 0, "bot emits pose frames");
-  assert(seen.attack > 0, "bot schedules an attack while live");
+  assert(seen.attack > 0 && seen.attackMsg && seen.attackMsg.kind === undefined && Number.isFinite(seen.attackMsg.sentAt), "bot throws a kind-less punch");
+  const dodger = new BotOpponent({ rng: () => 0, replyMs: 0 });
+  let dodge = null;
+  dodger.addEventListener("attackResult", (e) => { dodge = e.detail; });
+  dodger.sendEvent("attack", { id: 1, sentAt: 0 });
+  await new Promise((r) => setTimeout(r, 20));
+  assert(dodge?.outcome === "Dodge" && dodge.dmg === 0, "bot dodges at the fixed rate when the roll says dodge");
+  dodger.close();
   bot.close();
 }
 

@@ -4,19 +4,18 @@
 
 export const MAX_HP = 100;
 export const VERSUS_ROUND_S = 60;
-export const VERSUS_RESPAWN_DELAY_S = 1.2;
-export const DAMAGE = { jab: 8, hook: 12, uppercut: 15 };
-export const PERFECT_MULT = 1.5;
-export const GOOD_MULT = 1;
+// One attack shape in versus: the head circle. No punch-type table and no timing multiplier.
+export const ATTACK_DAMAGE = 10;
 export const BLOCK_DAMAGE_FACTOR = 0.5;
+// One swing sends one attack. A second punch event inside this window is ignored.
+export const PUNCH_ATTACK_COOLDOWN_S = 0.6;
 export const POSE_HZ = 20;
 export const OPP_RENDER_DELAY_S = 0.10;
 export const POSE_STALE_WARN_S = 3;
 export const POSE_STALE_DROP_S = 10;
 export const MAX_QUEUED_ATTACKS = 2;
 export const OPP_PANEL_W_FRAC = 0.28;
-// Reserved: the attack kind is the called punch, not the CNN label. Leave false.
-export const USE_PREDICTION_FOR_ATTACK = false;
+export const PIP_W_FRAC = 0.28;
 export const OPP_HOLD_S = 0.4;
 export const OPP_FADE_S = 0.4;
 export const OUTGOING_TTL_S = 6;
@@ -27,24 +26,22 @@ export const POSE_BUF_MAX = 30;
 
 const CYAN = [0, 255, 255];
 
-export function hitDamage(kind, mult) {
-  const base = DAMAGE[kind];
-  if (base == null || !Number.isFinite(mult)) return 0;
-  return Math.round(base * mult);
+export function hitDamage() {
+  return ATTACK_DAMAGE;
 }
 
-export function blockDamage(kind, mult) {
-  const base = DAMAGE[kind];
-  if (base == null || !Number.isFinite(mult)) return 0;
-  return Math.round(base * mult * BLOCK_DAMAGE_FACTOR);
+export function blockDamage() {
+  return Math.round(ATTACK_DAMAGE * BLOCK_DAMAGE_FACTOR);
 }
 
 export function applyHp(hp, dmg) {
   return Math.max(0, hp - Math.max(0, dmg || 0));
 }
 
-export function gradeMult(grade) {
-  return grade === "PERFECT" ? PERFECT_MULT : GOOD_MULT;
+// `nextAt` is the local time the player may throw again. A punch inside the window is dropped.
+export function acceptPunch(nextAt, now, cooldown = PUNCH_ATTACK_COOLDOWN_S) {
+  if (now < nextAt) return { ok: false, nextAt };
+  return { ok: true, nextAt: now + cooldown };
 }
 
 // Higher HP wins. Equal HP falls through to score, then a draw.
@@ -56,6 +53,27 @@ export function judge(myHp, oppHp, myScore, oppScore) {
 
 export function verdictTitle(verdict) {
   return verdict === "win" ? "YOU WIN" : verdict === "lose" ? "YOU LOSE" : "DRAW";
+}
+
+// Selfie mapping: camera x is mirrored into `rect`, which is either the full frame
+// or the picture-in-picture. The same fraction of the rect is the head in both,
+// so the dodge circle sits on the head that collision tests.
+export function mapCamPoint(camX, camY, frameW, frameH, rect) {
+  return [
+    rect.x + ((frameW - camX) / frameW) * rect.w,
+    rect.y + (camY / frameH) * rect.h,
+  ];
+}
+
+export function mapCamRadius(camR, frameW, rect) {
+  return camR * (rect.w / frameW);
+}
+
+export function pipRect(W, H) {
+  const w = PIP_W_FRAC * W;
+  const h = w * (H / Math.max(1, W));
+  const margin = Math.max(12, W / 60);
+  return { x: margin, y: H - margin - h, w, h };
 }
 
 // Returns false when the queue is full (caller sends outcome "dropped").
@@ -119,6 +137,9 @@ export class Versus {
     this.oppBuf = [];
     this.outgoing = new Map();
     this.attackSeq = 0;
+    this.nextPunchAt = 0;
+    this.handCue = null;
+    this._fast = { i: RW_I, speed: 0 };
     this.connected = false;
     this.localReady = false;
     this.oppReady = false;
@@ -196,15 +217,20 @@ export class Versus {
     this.lastPoseAt = performance.now() / 1000;
   }
 
-  // Called punch only. USE_PREDICTION_FOR_ATTACK stays false, so the CNN label is not read.
-  launchAttack(type, grade) {
-    if (grade !== "PERFECT" && grade !== "GOOD") return;
-    if (!DAMAGE[type]) return;
-    const mult = gradeMult(grade);
+  // A PunchDetector `punch` from either hand. The CNN label is not consulted.
+  notePunch(now) {
+    const step = acceptPunch(this.nextPunchAt, now);
+    this.nextPunchAt = step.nextAt;
+    if (!step.ok) return false;
+    this.launchAttack();
+    return true;
+  }
+
+  launchAttack() {
     const id = ++this.attackSeq;
     const sentAt = this.net.netNow();
-    this.outgoing.set(id, { id, kind: type, mult, grade, localT: performance.now() / 1000 });
-    this.net.sendEvent("attack", { id, kind: type, mult, sentAt });
+    this.outgoing.set(id, { id, localT: performance.now() / 1000 });
+    this.net.sendEvent("attack", { id, sentAt });
   }
 
   takeOutgoing(id) {
@@ -232,6 +258,8 @@ export class Versus {
     this.oppHp = MAX_HP;
     this.oppScore = 0;
     this.outgoing.clear();
+    this.nextPunchAt = 0;
+    this.handCue = null;
     this.pausedAccum = 0;
     this.pauseBegan = null;
     this.stale = false;
@@ -297,39 +325,80 @@ export class Versus {
     return this.remaining(now, startLocal) <= 0;
   }
 
-  // Lower-right panel, unmirrored: their camera x is used as-is, so their right
-  // hand (image-left) lands on the screen-left of the panel, as if they face us.
-  drawOpponent(ctx, W, H, S) {
-    const margin = Math.max(12, W / 60);
-    const pw = OPP_PANEL_W_FRAC * W;
-    const ph = pw * 9 / 16;
-    const x = W - margin - pw;
-    const y = H - margin - ph - 22 * S;
-    ctx.save();
-    ctx.fillStyle = "rgba(8,10,16,0.72)";
-    ctx.fillRect(x, y, pw, ph);
-    ctx.strokeStyle = "rgba(0,255,255,0.45)";
-    ctx.lineWidth = 2;
-    ctx.strokeRect(x, y, pw, ph);
+  // Pose wind-up or the attack message, whichever happens first, lights the throwing hand.
+  armHandCue(now) {
+    const i = this._fast.speed > 0.25 ? this._fast.i : RW_I;
+    if (!this.handCue || now - this.handCue.start > 1.2) this.handCue = { i, start: now };
+    else this.handCue.i = i;
+  }
+
+  // Full-screen opponent, raw camera x, so their right hand is on screen-left (facing us).
+  drawStage(ctx, W, H, S, now) {
     const renderT = this.net.netNow() - OPP_RENDER_DELAY_S;
     const sample = sampleOpponent(this.oppBuf, renderT);
     if (sample.k && sample.alpha > 0.02) {
       ctx.save();
-      ctx.beginPath();
-      ctx.rect(x, y, pw, ph);
-      ctx.clip();
-      ctx.globalAlpha = sample.alpha;
-      this._drawSkeleton(ctx, sample.k, renderT, { x, y, w: pw, h: ph }, S);
+      ctx.globalAlpha = Math.max(0.35, sample.alpha);
+      this._drawSkeleton(ctx, sample.k, renderT, { x: 0, y: 0, w: W, h: H }, S);
       ctx.restore();
+      this._noteMotion(sample.k, renderT, now);
       this._prevDraw = { t: renderT, k: sample.k };
     }
-    ctx.font = `bold ${14 * S}px system-ui, sans-serif`;
+    this._drawHandCue(ctx, W, H, S, now);
+    ctx.font = `bold ${18 * S}px system-ui, sans-serif`;
     ctx.textAlign = "center";
-    ctx.textBaseline = "top";
-    ctx.fillStyle = "#fff";
-    ctx.fillText(this.oppName, x + pw / 2, y + ph + 4 * S);
-    ctx.restore();
+    ctx.textBaseline = "bottom";
+    ctx.fillStyle = "rgba(180,255,255,0.85)";
+    ctx.fillText(this.oppName, W / 2, H - 16 * S);
     if (this.stale) this._banner(ctx, W, H, S, "Opponent connection lost");
+  }
+
+  _noteMotion(k, renderT, now) {
+    const prev = this._prevDraw;
+    const dt = prev ? renderT - prev.t : 0;
+    let best = { i: RW_I, speed: 0 };
+    if (prev && dt > 1e-4) {
+      for (const i of [LW_I, RW_I]) {
+        const dx = k[i * 3] - prev.k[i * 3];
+        const dy = k[i * 3 + 1] - prev.k[i * 3 + 1];
+        const speed = Math.hypot(dx, dy) / dt;
+        if (speed > best.speed) best = { i, speed };
+      }
+    }
+    this._fast = best;
+    if (best.speed > 0.4) this.armHandCue(now);
+  }
+
+  _drawHandCue(ctx, W, H, S, now) {
+    const cue = this.handCue;
+    const k = this._prevDraw?.k;
+    if (!cue || !k || now - cue.start > 1.8) {
+      if (cue && now - cue.start > 1.8) this.handCue = null;
+      return;
+    }
+    const x = k[cue.i * 3] * W;
+    const y = k[cue.i * 3 + 1] * H;
+    const age = now - cue.start;
+    const grow = Math.min(1, age / 0.35);
+    const flash = Math.max(0, 1 - age / 0.22);
+    const radius = (28 + 110 * grow) * S;
+    const g = ctx.createRadialGradient(x, y, 4, x, y, radius);
+    g.addColorStop(0, `rgba(255,255,255,${0.85 * Math.max(flash, 0.35)})`);
+    g.addColorStop(0.35, `rgba(255,170,40,${0.55 + 0.35 * flash})`);
+    g.addColorStop(1, "rgba(255,120,0,0)");
+    ctx.save();
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+    if (flash > 0.05) {
+      ctx.globalAlpha = flash;
+      ctx.fillStyle = "#fff";
+      ctx.beginPath();
+      ctx.arc(x, y, 18 * S, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
   _drawSkeleton(ctx, k, renderT, box, S) {
@@ -346,6 +415,7 @@ export class Versus {
       const dy = k[i * 3 + 1] - prev.k[i * 3 + 1];
       return Math.hypot(dx, dy) / dt;
     };
+    const thick = Math.max(S, box.w / 480);
     const chain = (indices, fast) => {
       ctx.beginPath();
       let on = false;
@@ -356,7 +426,7 @@ export class Versus {
         else ctx.lineTo(p[0], p[1]);
       }
       ctx.strokeStyle = css(CYAN);
-      ctx.lineWidth = (fast ? 7 : 3) * S;
+      ctx.lineWidth = (fast ? 8 : 4) * thick;
       ctx.lineJoin = "round";
       ctx.lineCap = "round";
       ctx.stroke();
@@ -365,11 +435,13 @@ export class Versus {
     chain([RS_I, RE_I, RW_I], speed(RW_I) > 0.45);
     chain([LH_I, RH_I], false);
     chain([LS_I, RS_I], false);
+    chain([LW_I, 9, 7, LW_I, 11], speed(LW_I) > 0.45); // index, pinky, thumb
+    chain([RW_I, 10, 8, RW_I, 12], speed(RW_I) > 0.45);
     const nose = pt(NOSE_I);
     if (nose) {
       ctx.beginPath();
       ctx.fillStyle = css(CYAN, 0.9);
-      ctx.arc(nose[0], nose[1], Math.max(4, box.w * 0.045), 0, Math.PI * 2);
+      ctx.arc(nose[0], nose[1], Math.max(10, box.w * 0.055), 0, Math.PI * 2);
       ctx.fill();
     }
   }
@@ -479,17 +551,17 @@ export class Versus {
 export function botSkeleton(t) {
   const sway = Math.sin(t * 1.4) * 0.02;
   const cycle = ((t % 4.5) + 4.5) % 4.5;
-  const punching = cycle > 3.9;
-  const p = punching ? Math.sin(((cycle - 3.9) / 0.6) * Math.PI) : 0;
+  const punching = cycle > 3.4;
+  const p = punching ? Math.sin(((cycle - 3.4) / 1.1) * Math.PI) : 0;
   const pts = [
-    [0.50, 0.20],
-    [0.40, 0.32], [0.60, 0.32],
-    [0.36, 0.46], [0.64 - 0.04 * p, 0.46 - 0.06 * p],
-    [0.34, 0.60], [0.66 - 0.12 * p, 0.60 - 0.18 * p],
-    [0.33, 0.64], [0.67 - 0.10 * p, 0.64 - 0.14 * p],
-    [0.32, 0.63], [0.68 - 0.11 * p, 0.63 - 0.15 * p],
-    [0.35, 0.62], [0.65 - 0.09 * p, 0.62 - 0.12 * p],
-    [0.44, 0.78], [0.56, 0.78],
+    [0.50, 0.22],
+    [0.38, 0.36], [0.62, 0.36],
+    [0.32, 0.52], [0.68 - 0.10 * p, 0.50 - 0.12 * p],
+    [0.30, 0.68], [0.74 - 0.32 * p, 0.66 - 0.36 * p],
+    [0.28, 0.74], [0.76 - 0.30 * p, 0.72 - 0.32 * p],
+    [0.27, 0.72], [0.78 - 0.31 * p, 0.70 - 0.30 * p],
+    [0.32, 0.70], [0.72 - 0.26 * p, 0.68 - 0.28 * p],
+    [0.42, 0.82], [0.58, 0.82],
   ];
   const k = [];
   for (const [x, y] of pts) k.push(Math.round((x + sway) * 1000) / 1000, Math.round(y * 1000) / 1000, 1);
@@ -564,8 +636,6 @@ export class BotOpponent extends EventTarget {
   }
 
   _answerAttack(payload) {
-    const mult = Math.min(1.5, Math.max(0.5, Number(payload.mult) || 1));
-    const kind = DAMAGE[payload.kind] != null ? payload.kind : "jab";
     let outcome, dmg;
     if (this.rng() < 0.5) {
       outcome = "Dodge";
@@ -573,11 +643,11 @@ export class BotOpponent extends EventTarget {
       this.score += DEFENSE_BONUS;
     } else if (this.rng() < 0.5) {
       outcome = "Block";
-      dmg = blockDamage(kind, mult);
+      dmg = blockDamage();
       this.score += BLOCK_SCORE;
     } else {
       outcome = "Hit";
-      dmg = hitDamage(kind, mult);
+      dmg = hitDamage();
       this.score = Math.max(0, this.score - 50);
     }
     this.hp = applyHp(this.hp, dmg);
@@ -620,10 +690,7 @@ export class BotOpponent extends EventTarget {
     this._atk = setTimeout(() => {
       this._atk = null;
       if (!this.live || this.closed) return;
-      const kinds = Object.keys(DAMAGE);
-      const kind = kinds[Math.floor(this.rng() * kinds.length)] || "jab";
-      const mult = this.rng() < 0.25 ? PERFECT_MULT : 1;
-      emitOn(this, "attack", { id: ++this.seq, kind, mult, sentAt: this.netNow() });
+      emitOn(this, "attack", { id: ++this.seq, sentAt: this.netNow() });
       this._scheduleAttack();
     }, delay);
     if (this._atk.unref) this._atk.unref();

@@ -11,7 +11,7 @@ A static, browser-only webcam boxing game. No server code: everything runs clien
 1. **Offense (prompted hits):** the game calls a punch ("LEFT JAB") and shows an osu!-style target with a shrinking approach ring. The user hits the target with the called hand when the ring closes. Timing is graded PERFECT / GOOD / MISS, and a CNN (ONNX) classifies the punch type from the skeleton motion.
 2. **Defense (dodges):** the game sends telegraphed orange attacks at the user's head: a jab circle, a hook band and an uppercut column. The user slips, ducks, steps aside or blocks with their forearms. Each attack ends as Dodge, Block or Hit.
 
-**Versus** (`GAME_MODE === "versus"`) is a 1v1 fight. Each browser still runs its own camera, pose tracker and punch model. Only keypoints and small JSON events cross the network, over PeerJS data channels. A PERFECT or GOOD hit becomes an attack on the opponent's head. Solo is the default and is unchanged when `GAME_MODE` stays `"solo"`.
+**Versus** (`GAME_MODE === "versus"`) is a 1v1 fight. Each browser still runs its own camera and pose tracker. Only keypoints and small JSON events cross the network, over PeerJS data channels. A real punch from `PunchDetector` (either hand) becomes one head-circle attack the opponent must dodge. There is no osu target, callout, or punch-type distinction in versus. Solo is the default and is unchanged when `GAME_MODE` stays `"solo"`. The versus picture is the opponent, full screen; your own camera is a thumbnail.
 
 The web game is a port of the repo's Python desktop game (`main_python_analysis.py`, `defense.py`, `target_utils.py`). The Python code is still the **source of truth for the ML pipeline and the model**. Gameplay constants are duplicated by hand.
 
@@ -110,9 +110,9 @@ Gameplay values match `main_python_analysis.py` / `defense.py`. Keep both in syn
 | `HIT_RADIUS_SCALE` | 3.0 | Collision radius = 75 px × S (needs tuning) |
 | `MAX_SAME_TARGET_IN_A_ROW` | 2 | Anti-repeat for type+side |
 | `SCORE_PERFECT/GOOD/DEFENSE_BONUS/HIT_PENALTY` | 300 / 100 / 50 / 50 | Score is floored at 0 |
-| `TARGET_RESPAWN_DELAY_S` | 2.0 | Gap after a target resolves. Versus uses `VERSUS_RESPAWN_DELAY_S` (1.2) instead of reassigning this const |
+| `TARGET_RESPAWN_DELAY_S` | 2.0 | Gap after a target resolves. Solo only; versus has no targets |
 | `SCHEDULE_MARGIN_S` / `RESERVED_MARGIN_S` | 0.1 | Spacing between punch moments and attack windows |
-| `MAX_RUNTIME` / `PRESTART_COUNTDOWN_S` | 30 / 3 | Solo round length and countdown. Versus length is `VERSUS_ROUND_S` (60); the const stays 30 |
+| `MAX_RUNTIME` / `PRESTART_COUNTDOWN_S` | 30 / 3 | Solo round length and countdown. Versus length is `VERSUS_ROUND_S` (60) |
 | `MODEL_CONF_THRESHOLD` | 0.55 | Below this the prediction is shown as "(low)" |
 | `WORLD_BUFFER_FRAMES` | 150 | World-skeleton buffer length |
 | `LOOK_BACK_SECONDS` | 2.5 | Fallback clip window |
@@ -124,8 +124,8 @@ Gameplay values match `main_python_analysis.py` / `defense.py`. Keep both in syn
 | **Attacks** | | |
 | `ATTACK_WARNING_S` / `ATTACK_ACTIVE_S` | 0.9 / 1.0 | Flashing warning, then the solid dodge window |
 | `ATTACK_FLASH_COUNT`, `ATTACK_WARNING_ALPHA`, `ATTACK_SWEEP_FRACTION` | 3, 0.35, 0.5 | Band fill crosses the screen in the first half of active |
-| `SPAWN_DELAY_RANGE`, `FIRST_ATTACK_DELAY_S` | [3, 7], 2.0 | Seconds between attacks / before the first attack. Ignored in versus |
-| `ATTACK_WEIGHTS` | jab .40, hook .35, uppercut .25 | Solo only. Versus passes the called kind into `spawnAttack` |
+| `SPAWN_DELAY_RANGE`, `FIRST_ATTACK_DELAY_S` | [3, 7], 2.0 | Seconds between attacks / before the first attack. Solo only |
+| `ATTACK_WEIGHTS` | jab .40, hook .35, uppercut .25 | Solo only. Versus always spawns the jab circle |
 | `JAB_RADIUS_SW`, `HOOK_BAND_HEIGHT_SW`, `UPPERCUT_BAND_WIDTH_SW` | 0.45, 0.4, 0.8 | In shoulder widths |
 | `HEAD_HALF_WIDTH_SW`, `HEAD_TOP_SW`, `HEAD_BOTTOM_SW` | 0.15, 0.35, 0.15 | Head box relative to the nose |
 | `GAME_MODE` | `"solo"` | `"solo"` or `"versus"`. Every versus branch checks this |
@@ -162,8 +162,8 @@ In versus, `st.start` is the local equivalent of the host's `t0` (`t0 - clockOff
    - Grade: PERFECT if `|gradeTs − ideal| ≤ 0.10`, else GOOD.
    - **MISS**: a called-hand punch event that isn't a hit, **or** the window has closed and the called hand isn't still `throwing` (or the 0.35 s grace has run out).
    - Off-hand punches and punches with no active target are ignored.
-   - Either result → `idle`, `nextSpawn = now + 2.0` (1.2 s in versus).
-   - **Versus:** a PERFECT or GOOD calls `versus.launchAttack(type, grade)` before `type` is cleared. The kind is the **called** punch. A MISS sends nothing. The CNN label stays on the prediction overlay.
+   - Either result → `idle`, `nextSpawn = now + 2.0`.
+   - **Versus does not run this loop.** `stepVersus` listens for a `punch` event from either hand and sends one attack, with `PUNCH_ATTACK_COOLDOWN_S` (0.6 s) so one swing cannot send two.
 5. `resolvePending` (each frame while `st.pending` is set): classify on the first matching `punch` event via `segmentClip`; otherwise, after the deadline, via `snapshotClip`.
 6. Defense update (see 5.7), then the osu! target is drawn on top.
 
@@ -173,17 +173,17 @@ In versus, `st.start` is the local equivalent of the host's `t0` (`t0 - clockOff
 - `snapshotClip(spawnTs)`: the fallback. Frames since the target spawned, or the last 2.5 s if there are too few.
 - `requestPrediction` builds the clip **synchronously**, because `worldBuf` keeps changing. Only `classify` is async.
 - `classify(type, side, clip)`: `null` clip → "Warming up (n/needed frames)". If `side !== choosePunchSide(type, false)` (not the stance-default hand: orthodox **left** jab, **left** hook, **right** uppercut), `mirrorSkeleton(clip)` is applied, because the model only learned one hand per class. Then `session.run({input: Tensor([1,7,50,4,3])})` → `out.logits` → softmax → the text "Predicted: Lead-Hook (82%)", shown for 1.8 s. Green means confident; orange means below 0.55.
-- **The prediction is display-only.** It doesn't affect the score or the versus attack. `USE_PREDICTION_FOR_ATTACK` in `versus.js` is `false` and unread. `MODEL_TO_TARGET` is defined but not used yet.
+- **The prediction is display-only in solo.** Versus does not classify punches for attacks. `MODEL_TO_TARGET` is defined but not used yet.
 
 ### 5.7 Defense (`defense` object, port of `DefenseGame`)
 - `update(lms, now, reserved)`: in **solo**, the first spawn comes 2 s into the round. It spawns when the timer is due and the would-be active window `[now+0.9, now+1.9]` doesn't overlap any `reserved` window (± 0.1). Otherwise it retries next frame. During `active` it runs `checkCollision`. If the active phase ends untouched → `"Dodge"`. It records `lastEvent = {outcome, pos: anchor, meta}`, schedules the next spawn in 3–7 s, and draws.
-- **Versus** skips `SPAWN_DELAY_RANGE` and `FIRST_ATTACK_DELAY_S`. `defense.enqueue(kind, meta)` pushes onto `queue` (max 2, via `enqueueAttack`). A full queue immediately sends `attackResult {outcome:"dropped", dmg:0}` and discards the new attack. While idle, `update` starts the head of the queue with the same overlap test. `spawnAttack(lms, now, kind)` skips the weight roll and still randomizes hook sweep direction. The uppercut still sweeps bottom → top. An `"INCOMING <KIND>"` banner is set for the warning, and `"ATTACK QUEUED"` is drawn while anything remains.
+- **Versus** skips `SPAWN_DELAY_RANGE`, `FIRST_ATTACK_DELAY_S`, and the reserved-window test (there is no punch window to protect). `defense.enqueue(meta)` pushes onto `queue` (max 2). A full queue sends `attackResult {outcome:"dropped", dmg:0}`. The next attack is always the jab circle on the local nose. `"INCOMING"` shows during the warning, and `"ATTACK QUEUED"` while another waits. The circle is not drawn inside `update`; the versus frame maps it onto the screen.
 - `spawnAttack`: a jab is a circle on the nose (clamped on-screen); a hook is a full-width band at nose height with a random sweep direction; an uppercut is a full-height column at the body centre, sweeping bottom → top.
 - `Attack`: `phase(now)` returns `"warning"`, `"active"`, or `"done"` (there is no `"over"` state). `sweptRect(now)` is the part of the band covered so far, `dangerShape(now)` is the whole circle for a jab or the swept rect for bands (`null` outside active), and `draw(now)`.
 - `checkCollision`: `null` if the danger shape misses the head box (`headRect`). **Block** if a forearm box (elbow→wrist, padded 20·S) overlaps both the padded head zone and the danger shape. Otherwise **Hit**. Everything is 2D, so leaning back from an uppercut can't be detected.
 - Back in `stepRound`, solo: Hit → −50 (floored at 0), red vignette, "HIT!". Dodge or Block → +50, "DODGED!" / "BLOCKED!".
-- Versus outcomes are applied by `applyVersusDefense`: Dodge → 0 damage and +50. Block → `blockDamage` (half, rounded) and +25. Hit → `hitDamage`, −50 (floored at 0), vignette, "HIT!". Then `attackResult` and `state` are sent. HP 0 sends `ko` and ends the round.
-- **Scheduling contract:** offense won't schedule across an attack's active window, and defense won't start an active window across a reserved punch window. Keep both checks when you change the timing. Versus uses the same two checks; it only changes where the attack kind comes from.
+- Versus outcomes are applied by `applyVersusDefense`: Dodge → 0 damage and +50. Block → half of `ATTACK_DAMAGE` (5) and +25. Hit → `ATTACK_DAMAGE` (10), −50 (floored at 0), vignette, "HIT!". Then `attackResult` and `state` are sent. HP 0 sends `ko` and ends the round. Collision still uses the local camera landmarks and the circle in camera pixels.
+- **Scheduling contract (solo):** offense won't schedule across an attack's active window, and defense won't start an active window across a reserved punch window. Versus has no target windows, so it does not consult `reserved`.
 
 ### 5.8 Drawing helpers
 `fillCircle`, `strokeCircle`, `fillRect`, `fitFont` (sizes `ctx.font` to fit a box), `textCentered` (outlined text), `drawOsuTarget` (glow, body, ring shrinking from 3r to r; the edge pulses after the ideal moment), `drawCallout` (full-width banner that scales in and fades out), `pill`, `drawHud` (solo: time top-left, red at ≤ 5 s; score top-right), `drawVignette`, `drawPunchPeaks` / `drawPunchState` (debug).
@@ -200,10 +200,10 @@ Each is marked `// VERSUS:` in `game.js`.
 | `attachVersus` | Builds `Versus` on a `Net` or a `BotOpponent` and listens for the protocol events. |
 | `loop` tick + `sendPose` | After `detector.update`, including lobby and countdown. Image landmarks only. |
 | Countdown | `ceil(t0 - netNow())`, then `newRound(t0 - clockOffset)`. |
-| `launchAttack` | On PERFECT / GOOD, before the callout state is cleared. |
-| Respawn gap | 1.2 s in versus, 2.0 s in solo. |
-| `applyVersusDefense` | Damage, block score, `attackResult`, KO. |
-| `spawnAttack(kind)` / queue | Random timer off in versus. |
+| `stepVersus` | Punch events only. Cooldown, then one attack. No callout or target. |
+| `drawVersusFrame` | Opponent full screen, dodge circle, local camera thumbnail. |
+| `applyVersusDefense` | Fixed damage, block score, `attackResult`, KO. |
+| `spawnAttack("jab")` / queue | Random timer off. Circle only. |
 | HUD / banners | HP bars, or the solo `drawHud`. |
 | `endRound` | Versus returns before stopping the camera. |
 | Result card clicks | Rematch and Leave, hit-tested in canvas pixels. |
@@ -262,7 +262,7 @@ A rule-based detector with no DOM, so it runs under node. It is fed **image** la
 
 ## 9. Known gaps and good next steps
 
-- Prediction correctness isn't scored or tallied. Comparing `MODEL_TO_TARGET[name]` with `type` and the confidence threshold, then adding accuracy counters, would bring it level with Python. `USE_PREDICTION_FOR_ATTACK` is the reserved switch for using that label as the attack kind.
+- Prediction correctness isn't scored or tallied. Comparing `MODEL_TO_TARGET[name]` with `type` and the confidence threshold, then adding accuracy counters, would bring solo level with Python. Versus does not use the classifier.
 - No session metrics file. Solo still only prints totals. Versus draws a card but doesn't persist it.
 - No calibration step, so a user who is too close or too far gets bad targets and attacks.
 - `SHOW_PUNCH_DEBUG` is on by default.
@@ -324,7 +324,7 @@ The pose channel cannot use `t` for both the type and the sample time. Its packe
 | `pong` | events | `id, c0, s1, s2` | the receiver of a ping |
 | `ready` | events | `ready` | both |
 | `start` | events | `t0` | host only. `t0 = netNow() + 3.5` (3 s countdown after a 0.5 s margin) |
-| `attack` | events | `id, kind, mult, sentAt` | the attacker. `kind` is jab/hook/uppercut. `mult` is 1.5 or 1, clamped to [0.5, 1.5] on receive. Any other kind is dropped |
+| `attack` | events | `id, sentAt` | the attacker. One shape, the head circle. `kind` and `mult` are ignored if present. An attack with no `id` is dropped |
 | `attackResult` | events | `id, outcome, dmg` | the defender. `outcome` is Dodge, Block, Hit, or dropped |
 | `state` | events | `hp, score` | whoever's totals changed, and at least every 1 s. Each client owns its own HP and score |
 | `ko` | events | `loser: "me" \| "you"` | the client whose HP hit 0 sends `"me"` |
@@ -339,23 +339,21 @@ Constants live at the top of `versus.js`:
 |---|---|
 | `MAX_HP` | 100 |
 | `VERSUS_ROUND_S` | 60 |
-| `VERSUS_RESPAWN_DELAY_S` | 1.2 |
-| `DAMAGE` | jab 8, hook 12, uppercut 15 |
-| `PERFECT_MULT` | 1.5 (GOOD is 1) |
+| `ATTACK_DAMAGE` | 10 |
+| `PUNCH_ATTACK_COOLDOWN_S` | 0.6 |
 | `BLOCK_DAMAGE_FACTOR` | 0.5 |
 | `POSE_HZ` | 20 |
 | `OPP_RENDER_DELAY_S` | 0.10 |
 | `POSE_STALE_WARN_S` / `POSE_STALE_DROP_S` | 3 / 10 |
 | `MAX_QUEUED_ATTACKS` | 2 |
-| `OPP_PANEL_W_FRAC` | 0.28 |
-| `USE_PREDICTION_FOR_ATTACK` | false |
+| `PIP_W_FRAC` | 0.28 |
 | `OPP_HOLD_S` / `OPP_FADE_S` | 0.4 / 0.4 |
 | `OUTGOING_TTL_S` | 6 |
 | `BLOCK_SCORE` / `LANDED_BONUS` | 25 / 100 |
 
-Hit damage is `round(DAMAGE[kind] * mult)`. A block is `round(DAMAGE[kind] * mult * 0.5)`. A PERFECT jab is 12, a GOOD jab is 8, a PERFECT hook is 18, and a block on a PERFECT uppercut is `round(22.5 * 0.5)` = 11. HP never goes below 0.
+A clean hit removes `ATTACK_DAMAGE` (10). A block removes `round(10 * 0.5)` = 5. There is no PERFECT multiplier and no jab/hook/uppercut table. HP never goes below 0.
 
-The attacker already received +300 / +100 for the grade. When the result arrives they also get +100 for a Hit, and floating text `LANDED -N`, `DODGED`, or `BLOCKED` next to the opponent panel. `dropped` and anything unanswered after 6 s are removed quietly.
+The attacker does not score a grade. When the result arrives they get +100 for a Hit, and floating text `LANDED -10`, `DODGED`, or `BLOCKED`. `dropped` and anything unanswered after 6 s are removed quietly.
 
 The round ends at `t0 + 60 s`, or on KO. The displayed clock pauses while the opponent pose is stale (3–10 s) and the round is not ended by the clock during that pause. At 10 s with no pose the link is treated as a disconnect. Higher HP wins; equal HP uses score; otherwise it is a draw.
 
@@ -363,22 +361,26 @@ Closing the link mid-round shows "Opponent left" and a forfeit win for the playe
 
 Rematch: both clients send `rematch`, HP / score / queues reset, and the host sends a new `start`. The camera and models stay loaded.
 
-### 11.5 Opponent pose
-`versus.js` keeps `oppBuf`, the last 30 `{t, k}` samples (older than ~2 s are pruned, and a sample older than the newest is ignored). The panel is drawn at `renderT = netNow() - 0.10` by linearly interpolating the two samples that straddle `renderT`. Past the newest sample, that sample is held for 0.4 s and then fades out over 0.4 s. The panel is `0.28 * W` wide, 16:9, lower right, dark, unmirrored. The skeleton is shoulder–elbow–wrist, a nose circle, and the hip line, in neon cyan, with a thicker arm when that wrist is moving fast. The name sits under the panel.
+### 11.5 Picture
+`versus.js` keeps `oppBuf`, the last 30 `{t, k}` samples (older than ~2 s are pruned, and a sample older than the newest is ignored). The opponent is drawn full screen at `renderT = netNow() - 0.10`, interpolating the two samples that straddle `renderT`. Past the newest sample, that sample is held for 0.4 s and then fades out over 0.4 s. Coordinates are the sender's raw camera x, so their right hand is on screen-left, as if they face you. The drawing is head, shoulders, arms, hands, and hips, in neon cyan, thicker when that wrist is moving fast.
+
+The local camera is a thumbnail (`pipRect`, bottom left, `PIP_W_FRAC` wide, camera aspect, mirrored selfie) with the local skeleton on top of it. That thumbnail is how you see yourself slip.
+
+The dodge circle is spawned in **camera pixels** on the local nose, and `checkCollision` is unchanged. `mapCamPoint` / `mapCamRadius` mirror that circle into a rectangle. The full frame and the thumbnail are two rectangles fed to the same function, so the circle sits on the head in the thumbnail and at the same fraction of the main view (aimed at the viewer). A fast opponent wrist, or the `attack` message if it arrives first, starts a flash and a growing glow on that hand, plus the word `INCOMING`, and then the warning/active circle.
 
 ### 11.6 Lobby, HUD, `?bot=1`
 The start panel has Solo, Create room, and Join room (5-character code, uppercased), plus a name field (default "Player") sent in `hello`. After the link: the code and a Copy button, "Opponent connected: \<name\>", ping, and a Ready control for each side. The host sees Start only when both are ready. Leave closes the peer and returns to the lobby.
 
 The versus HUD replaces the solo score pill: my HP bar, name and score on the top left (green to red as HP falls); the opponent's bar on the top right, filling from the right; the clock and `ping NN ms` in the top center (red at ≤ 5 s).
 
-`?bot=1` sets up a versus room whose peer is `BotOpponent`. It implements the same `EventTarget` surface as `Net` (`sendEvent`, `sendPose`, `netNow`, `close`, plus `setLive`) and does not load PeerJS. It emits a swaying skeleton, throws an attack every 4–8 s while the round is live, answers `attack` with a 50 % dodge (otherwise block or hit) using the real damage helpers, and sends `state`. One tab can play a full versus round.
+`?bot=1` sets up a versus room whose peer is `BotOpponent`. It implements the same `EventTarget` surface as `Net` (`sendEvent`, `sendPose`, `netNow`, `close`, plus `setLive`) and does not load PeerJS. Its skeleton fills the main view, sways, and reaches in with the right arm every few seconds. While the round is live it sends an `attack` (`id`, `sentAt` only) every 4–8 s, which you dodge on the head circle. It answers your punches with a 50 % dodge (otherwise block or hit) using the fixed damage, and sends `state`. One tab can play a full versus round.
 
 ### 11.7 Deviations from the written spec
 These follow the code that was already in the repo.
 
 - `Attack.phase` returns `"done"`, not `"over"`. Resolution is unchanged: Hit or Block as soon as `checkCollision` says so, Dodge when the active window ends.
 - Pose packets use `t` as the sample time. Events packets use `t` as the type. One field cannot be both.
-- `TARGET_RESPAWN_DELAY_S` and `MAX_RUNTIME` stay at their solo values. Versus reads `VERSUS_RESPAWN_DELAY_S` and `VERSUS_ROUND_S` behind `GAME_MODE`.
+- `TARGET_RESPAWN_DELAY_S` and `MAX_RUNTIME` stay at their solo values. Versus does not spawn targets; its round length is `VERSUS_ROUND_S`.
 - The host also sends ping/pong, so both HUDs can show a ping. Only the guest writes `clockOffset`.
 - `endRound` still `console.log`s the totals in versus, and also draws the card. The camera is not stopped.
 - A name field was added so `hello` and the HUD have something to show. The fade after a held pose lasts 0.4 s (the spec says "fade" and not for how long).
