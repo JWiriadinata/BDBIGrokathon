@@ -8,7 +8,11 @@ test("health floor + KO end", () => {
   L.handle(a, JSON.stringify({ type: "create_room", name: "a" }));
   L.handle(b, JSON.stringify({ type: "join_room", code: a.room.code, name: "b" }));
   L.ready(a); L.ready(b); t = 4000;
-  for (let i = 0; i < 11; i++) {
+  // Hit -20 -> KO after 5; extra punches after KO are ignored.
+  L.punch(a, { kind: "jab" }); t += 1000;
+  L.outcome(b, { attackId: b.out.findLast((m) => m.type === "attack").attackId, result: "Block" });
+  assert.equal(a.room.match.health.b, 95);
+  for (let i = 0; i < 6; i++) {
     t += 1000; L.punch(a, { kind: "jab" });
     const id = b.out.findLast((m) => m.type === "attack").attackId;
     L.outcome(b, { attackId: id, result: "Hit" });

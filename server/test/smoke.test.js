@@ -58,7 +58,7 @@ test("two-client match smoke", async () => {
     assert.equal((await a.next("error")).reason, "rejected");
     b.send({ type: "outcome", attackId: atk.attackId, result: "Hit" });
     const st = await a.next("state");
-    assert.equal(st.health[joined.playerId], 90); assert.equal(st.health[aId], 100);
+    assert.equal(st.health[joined.playerId], 80); assert.equal(st.health[aId], 100);
 
     b.ws.close();
     assert.equal((await a.next("match_end")).reason, "disconnect");

@@ -1,6 +1,6 @@
 // Pure room/match logic (no sockets). Each player is {id, name, send(msgObj)}.
 export const START_HEALTH = 100;
-export const DAMAGE = { Hit: 10, Block: 2, Dodge: 0 };
+export const DAMAGE = { Hit: 20, Block: 5, Dodge: 0 };
 export const MATCH_DURATION_S = 90, COUNTDOWN_MS = 3000, PUNCH_MIN_GAP_MS = 600;
 export const KINDS = ["jab", "hook", "uppercut"];
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
